@@ -64,6 +64,17 @@ export class DeepSeekBridge {
     }
   }
 
+  /** 由系统返回（返回键/侧滑）触发；Web 层 App.tsx 的 onBack 负责关闭最上层界面 */
+  notifyBack(): void {
+    try {
+      this.controller.runJavaScript(
+        "window.dispatchEvent(new Event('android-back', { cancelable: true }))"
+      )
+    } catch (err) {
+      console.error(`notifyBack failed: ${JSON.stringify(err)}`)
+    }
+  }
+
   private dispatchEvent(name: string, detail: string): void {
     try {
       this.controller.runJavaScript(
@@ -129,7 +140,10 @@ export class DeepSeekBridge {
     AppStorage.setOrCreate('darkBars', dark)
   }
 
-  setHandlesBack(_handlesBack: boolean): void {
+  setHandlesBack(handlesBack: boolean): void {
+    // Web 层计数器：有可关闭的界面层（抽屉/对话框/面板）时登记 true，
+    // Index.onBackPress 据此拦截系统返回并派发 android-back 给 Web 消费
+    AppStorage.setOrCreate('dsHandlesBack', handlesBack)
   }
 
   setBackPreviewEnabled(_enabled: boolean): void {
@@ -261,16 +275,106 @@ export class DeepSeekBridge {
     return this.closeExport()
   }
 
-  beginImageSave(_name: string, _mime: string): boolean {
-    return false
+  // ===== 图片保存（写入公共 Download/DeepSeek Replica/Images/，与导出同模式） =====
+
+  private imageFd: number = -1
+  private imagePath: string | null = null
+  private static readonly IMAGE_SUBDIR: string = 'DeepSeek Replica/Images'
+
+  /** 图片保存目录未就绪（未授权）时申请权限，为下次保存做准备 */
+  private requestDownloadPermission(): void {
+    abilityAccessCtrl.createAtManager()
+      .requestPermissionsFromUser(this.context, ['ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY'])
+      .catch((err: BusinessError) => {
+        console.error(`download permission request failed: ${JSON.stringify(err)}`)
+      })
   }
 
-  writeImageSave(_bytes: string): boolean {
-    return false
+  beginImageSave(name: string, mime: string): boolean {
+    let fileName = name.replace(/[/\\]+/g, '_').trim()
+    let type = mime
+    if (!type.startsWith('image/')) {
+      // mime 缺省时从扩展名推断（对齐 Android ImageSave）
+      const dot = fileName.lastIndexOf('.')
+      if (dot < 0) {
+        return false
+      }
+      const ext = fileName.substring(dot + 1).toLowerCase()
+      if (ext === 'png') {
+        type = 'image/png'
+      } else if (ext === 'webp') {
+        type = 'image/webp'
+      } else if (ext === 'gif') {
+        type = 'image/gif'
+      } else if (ext === 'jpg' || ext === 'jpeg') {
+        type = 'image/jpeg'
+      } else {
+        return false
+      }
+    }
+    const sanitized = this.sanitizeExportName(fileName)
+    if (sanitized === null) {
+      return false
+    }
+    const dir = this.pickDownloadDir()
+    if (dir === null) {
+      this.requestDownloadPermission()
+      return false
+    }
+    try {
+      const target = `${dir}/${DeepSeekBridge.IMAGE_SUBDIR}`
+      if (!fs.accessSync(target).valueOf()) {
+        fs.mkdirSync(target, true)
+      }
+      const file = fs.openSync(`${target}/${sanitized}`,
+        fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC)
+      this.imageFd = file.fd
+      this.imagePath = `${target}/${sanitized}`
+      return true
+    } catch (err) {
+      console.error(`beginImageSave failed: ${JSON.stringify(err)}`)
+      return false
+    }
   }
 
-  finishImageSave(_keep: boolean): boolean {
-    return false
+  writeImageSave(bytes: string): boolean {
+    if (this.imageFd < 0 || bytes.length > 65536) {
+      return false
+    }
+    try {
+      const data = new util.Base64Helper().decodeSync(bytes)
+      fs.writeSync(this.imageFd, data.buffer as ArrayBuffer)
+      return true
+    } catch (err) {
+      console.error(`writeImageSave failed: ${JSON.stringify(err)}`)
+      this.finishImageSave(false)
+      return false
+    }
+  }
+
+  finishImageSave(keep: boolean): boolean {
+    const fd = this.imageFd
+    const path = this.imagePath
+    this.imageFd = -1
+    this.imagePath = null
+    if (fd < 0) {
+      return false
+    }
+    try {
+      fs.closeSync(fd)
+    } catch (err) {
+      console.error(`closeImageSave failed: ${JSON.stringify(err)}`)
+      return false
+    }
+    if (!keep && path !== null) {
+      try {
+        fs.unlinkSync(path)
+      } catch (err) {
+        console.error(`unlinkImageSave failed: ${JSON.stringify(err)}`)
+      }
+      return false
+    }
+    return true
   }
 
   // ===== 录音（阶段 2 实现） =====

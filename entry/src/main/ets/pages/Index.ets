@@ -178,15 +178,12 @@ struct Index {
   }
 
   onBackPress(): boolean {
-    // 阶段 0 简化协议：Web 可后退则后退，否则交给系统退出
-    // TODO 阶段 1：按 Web 层 android-back 事件协议（setHandlesBack 状态机）完整实现
-    try {
-      if (this.controller.accessBackward()) {
-        this.controller.backward()
-        return true
-      }
-    } catch (err) {
-      console.error(`onBackPress: ${JSON.stringify(err)}`)
+    // Web 层 android-back 协议：Web 通过 setHandlesBack 登记是否有可关闭的
+    // 界面层（抽屉/对话框/面板）。有 → 派发 android-back 由 Web 关闭最上层；
+    // 无 → 交给系统（退出应用）。侧滑手势与返回键同样走本回调。
+    if (AppStorage.get<boolean>('dsHandlesBack') === true) {
+      this.bridge.notifyBack()
+      return true
     }
     return false
   }
