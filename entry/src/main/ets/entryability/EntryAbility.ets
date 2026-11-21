@@ -1,11 +1,18 @@
 import { AbilityConstant, UIAbility, Want, abilityAccessCtrl, Permissions } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
+import display from '@ohos.display'
 import { hilog } from '@kit.PerformanceAnalysisKit'
 
 const TAG = 'EntryAbility'
 
 export default class EntryAbility extends UIAbility {
+  /** avoid area 返回物理 px，Web 层 CSS px = vp，按 Android /density 语义换算 */
+  private toVp(px: number): number {
+    const d = display.getDefaultDisplaySync().densityPixels
+    return d > 0 ? px / d : px
+  }
+
   onCreate(_want: Want, _launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(0x0000, TAG, 'onCreate')
   }
@@ -19,9 +26,9 @@ export default class EntryAbility extends UIAbility {
       const systemArea = mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM)
       const navArea = mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR)
       const keyboardArea = mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_KEYBOARD)
-      AppStorage.setOrCreate<number>('statusInset', systemArea.topRect.height)
-      AppStorage.setOrCreate<number>('buttonNavigationInset', navArea.bottomRect.height)
-      AppStorage.setOrCreate<number>('keyboardInset', keyboardArea.bottomRect.height)
+      AppStorage.setOrCreate<number>('statusInset', this.toVp(systemArea.topRect.height))
+      AppStorage.setOrCreate<number>('buttonNavigationInset', this.toVp(navArea.bottomRect.height))
+      AppStorage.setOrCreate<number>('keyboardInset', this.toVp(keyboardArea.bottomRect.height))
       hilog.info(0x0000, TAG,
         `insets status=${systemArea.topRect.height} nav=${navArea.bottomRect.height} kb=${keyboardArea.bottomRect.height}`)
 
@@ -31,9 +38,9 @@ export default class EntryAbility extends UIAbility {
           AppStorage.setOrCreate<number>('keyboardInset', data.area.bottomRect.height)
           AppStorage.setOrCreate<boolean>('keyboardVisible', data.area.bottomRect.height > 0)
         } else if (data.type === window.AvoidAreaType.TYPE_SYSTEM) {
-          AppStorage.setOrCreate<number>('statusInset', data.area.topRect.height)
+          AppStorage.setOrCreate<number>('statusInset', this.toVp(data.area.topRect.height))
         } else if (data.type === window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR) {
-          AppStorage.setOrCreate<number>('buttonNavigationInset', data.area.bottomRect.height)
+          AppStorage.setOrCreate<number>('buttonNavigationInset', this.toVp(data.area.bottomRect.height))
         }
       })
     } catch (err) {
