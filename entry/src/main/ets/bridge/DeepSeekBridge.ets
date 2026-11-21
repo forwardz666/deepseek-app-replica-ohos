@@ -187,7 +187,6 @@ export class DeepSeekBridge {
     }
     return null
   }
-
   private sanitizeExportName(raw: string): string | null {
     let name = raw
     const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'))
@@ -312,6 +311,27 @@ export class DeepSeekBridge {
     promptAction.showToast({ message: zh ? msgZh : msgEn, duration: 2000 })
   }
 
+  /**
+   * 确保目录存在。注意：fs.accessSync 对不存在的路径会**抛出 13900002**
+   * 而不是返回 false（文档 invalid），因此不能用返回值判断，必须 try/catch。
+   */
+  private ensureDir(dir: string): boolean {
+    try {
+      if (fs.accessSync(dir)) {
+        return true
+      }
+    } catch (err) {
+      // 不存在（13900002）或其他异常：尝试创建
+    }
+    try {
+      fs.mkdirSync(dir, true)
+      return true
+    } catch (err) {
+      console.error(`ensureDir failed: ${dir} ${JSON.stringify(err)}`)
+      return false
+    }
+  }
+
   beginImageSave(name: string, mime: string): boolean {
     let fileName = name.replace(/[/\\]+/g, '_').trim()
     let type = mime
@@ -351,8 +371,8 @@ export class DeepSeekBridge {
     }
     try {
       const dir = `${this.context.cacheDir}/${DeepSeekBridge.IMAGE_SAVES_DIR}`
-      if (!fs.accessSync(dir).valueOf()) {
-        fs.mkdirSync(dir, true)
+      if (!this.ensureDir(dir)) {
+        return false
       }
       const file = fs.openSync(`${dir}/${sanitized}`,
         fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC)

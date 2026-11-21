@@ -1,6 +1,7 @@
 import { webview } from '@kit.ArkWeb'
 import { common } from '@kit.AbilityKit'
 import { fileIo as fs, picker } from '@kit.CoreFileKit'
+import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit'
 import { DeepSeekBridge } from '../bridge/DeepSeekBridge'
 
@@ -13,6 +14,9 @@ import { DeepSeekBridge } from '../bridge/DeepSeekBridge'
 // 阶段 0 暂不注入 CSP：resource:// scheme 可能被赋予 opaque origin，'self' 会全拦。
 // TODO 阶段 1：日志确认 origin 语义后按 Android 版 CSP（MainActivity.java:238-240）恢复。
 const RAW_PREFIX = 'resource://rawfile/'
+
+// accept 以扩展名形式给出时的图片后缀白名单（判断是否走相册）
+const IMAGE_EXTS: string[] = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'avif']
 
 // 手机 ArkWeb 的宽度类媒体查询按物理像素（而非 CSS vp）求值：布局宽度正确
 // （innerWidth ≈ 视口 vp），但 matchMedia/@media 断点被放大 dpr 倍比较，导致
@@ -142,6 +146,7 @@ struct Index {
   @State diag2: string = ''
   @State diag3: string = ''
   @State diagErr: boolean = false
+  @State diagPicker: string = ''
   @State webSrc: string = 'about:blank'
   controller: webview.WebviewController = new webview.WebviewController()
   private bridge: DeepSeekBridge =
@@ -211,6 +216,13 @@ struct Index {
 
   build() {
     Column() {
+      if (this.diagPicker !== '') {
+        Text(this.diagPicker)
+          .width('100%')
+          .fontSize(9)
+          .fontColor('#0A59F7')
+          .padding({ left: 4, right: 4, top: 2, bottom: 2 })
+      }
       Web({ src: this.webSrc, controller: this.controller })
       .javaScriptProxy({
         object: this.bridge,
@@ -264,8 +276,14 @@ struct Index {
         this.diag = `${this.diag} | attached`.substring(0, 240)
       })
       .onShowFileSelector((event: OnShowFileSelectorEvent): boolean => {
-        this.onWebFileSelector(event)
-        return true
+        // 整个处理必须包裹：任何同步异常都会让引擎按 false 处理 → 弹默认 UI
+        try {
+          this.onWebFileSelector(event)
+          return true
+        } catch (err) {
+          console.error(`onShowFileSelector failed: ${JSON.stringify(err)}`)
+          return false
+        }
       })
       .onPageBegin((event: OnPageBeginEvent) => {
         const u: string = event.url
@@ -323,30 +341,87 @@ struct Index {
    * Web 层按 File 对象继续原有上传流程，无需改动。
    */
   private onWebFileSelector(event: OnShowFileSelectorEvent): void {
-    const selector: FileSelectorParam = event.fileSelector
-    const accept: Array<string> = selector.getAcceptType()
-    let isImage = false
-    for (let i = 0; i < accept.length; i++) {
-      if (accept[i].startsWith('image/')) {
-        isImage = true
-        break
-      }
+    // 临时诊断：把 ArkWeb 传回的真实 accept/mime/capture 打到屏幕上
+    let info = ''
+    try {
+      const accept: Array<string> = event.fileSelector.getAcceptType()
+      info = `accept=[${accept.join('|')}]`
+    } catch (err) {
+      info = 'accept:ERR'
     }
-    const device = deviceInfo.deviceType
-    if (isImage && !selector.isCapture() && device !== '2in1') {
+    try {
+      const mimes: Array<string> = event.fileSelector.getMimeTypes()
+      info = `${info} mime=[${mimes.join('|')}]`
+    } catch (err) {
+      info = `${info} mime:ERR`
+    }
+    try {
+      info = `${info} cap=${event.fileSelector.isCapture()} mode=${event.fileSelector.getMode()}`
+    } catch (err) {
+      info = `${info} cap:ERR`
+    }
+    const isImage = this.selectorAcceptsImages(event.fileSelector)
+    this.diagPicker = `${info} img=${isImage} dev=${deviceInfo.deviceType}`
+    this.pickRoute(event, isImage)
+  }
+
+  private pickRoute(event: OnShowFileSelectorEvent, isImage: boolean): void {
+    if (isImage && !event.fileSelector.isCapture() && deviceInfo.deviceType !== '2in1') {
       this.pickFromGallery(event)
       return
     }
     this.pickWithDocumentPicker(event)
   }
 
+  /**
+   * 判断 Web 侧是否只要图片。ArkWeb 在不同版本下 getAcceptType() 可能返回
+   * MIME（image/*）也可能返回扩展名（.jpg），隐式 input 甚至可能返回空数组；
+   * getMimeTypes() 是 API 18 新增，旧内核调用会抛异常，因此单独 try 包裹。
+   */
+  private selectorAcceptsImages(selector: FileSelectorParam): boolean {
+    try {
+      const mimes: Array<string> = selector.getMimeTypes()
+      for (let i = 0; i < mimes.length; i++) {
+        const m = mimes[i].toLowerCase()
+        if (m === 'image/*' || m.startsWith('image/')) {
+          return true
+        }
+      }
+    } catch (err) {
+      // 旧内核无 getMimeTypes：继续用 accept 判断
+    }
+    try {
+      const accept: Array<string> = selector.getAcceptType()
+      for (let i = 0; i < accept.length; i++) {
+        const a = accept[i].toLowerCase().trim()
+        if (a === 'image/*' || a.startsWith('image/')) {
+          return true
+        }
+        if (a.startsWith('.') && IMAGE_EXTS.includes(a.substring(1))) {
+          return true
+        }
+      }
+    } catch (err) {
+      console.error(`getAcceptType failed: ${JSON.stringify(err)}`)
+    }
+    return false
+  }
+
   private pickFromGallery(event: OnShowFileSelectorEvent): void {
-    const photoPicker = new picker.PhotoViewPicker()
-    const options: picker.PhotoSelectOptions = {
-      MIMEType: picker.PhotoViewMIMETypes.IMAGE_TYPE,
+    let photoPicker: photoAccessHelper.PhotoViewPicker
+    try {
+      photoPicker = new photoAccessHelper.PhotoViewPicker()
+    } catch (err) {
+      // 内核不支持时退回系统文件选择器，至少不弹空
+      console.error(`PhotoViewPicker unavailable: ${JSON.stringify(err)}`)
+      this.pickWithDocumentPicker(event)
+      return
+    }
+    const options: photoAccessHelper.PhotoSelectOptions = {
+      MIMEType: photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE,
       maxSelectNumber: 9
     }
-    photoPicker.select(options).then((result: picker.PhotoSelectResult) => {
+    photoPicker.select(options).then((result: photoAccessHelper.PhotoSelectResult) => {
       const uris: Array<string> = result.photoUris
       if (!uris || uris.length === 0) {
         event.result.handleFileList([])
@@ -354,13 +429,7 @@ struct Index {
       }
       const ctx = getContext(this) as common.UIAbilityContext
       const dir = `${ctx.cacheDir}/picked`
-      try {
-        if (!fs.accessSync(dir).valueOf()) {
-          fs.mkdirSync(dir, true)
-        }
-      } catch (err) {
-        // mkdir 失败时单个 copy 也会失败并跳过
-      }
+      this.ensureDir(dir)
       const files: string[] = []
       const stamp = Date.now()
       for (let i = 0; i < uris.length; i++) {
@@ -378,7 +447,7 @@ struct Index {
           }
           files.push(`file://${dst}`)
         } catch (err) {
-          // 单张失败不影响其余选中项
+          console.error(`copy picked photo failed: ${JSON.stringify(err)}`)
         }
       }
       event.result.handleFileList(files)
@@ -386,6 +455,22 @@ struct Index {
       console.error(`gallery pick failed: ${JSON.stringify(err)}`)
       event.result.handleFileList([])
     })
+  }
+
+  /** fs.accessSync 对不存在的路径会抛异常而非返回 false，必须 try/catch。 */
+  private ensureDir(dir: string): void {
+    try {
+      if (fs.accessSync(dir)) {
+        return
+      }
+    } catch (err) {
+      // 不存在或其他异常：尝试创建
+    }
+    try {
+      fs.mkdirSync(dir, true)
+    } catch (err) {
+      console.error(`ensureDir failed: ${dir} ${JSON.stringify(err)}`)
+    }
   }
 
   /** 读头部魔数推断扩展名（相册 uri 不携带文件名信息）。 */
@@ -422,7 +507,8 @@ struct Index {
 
   /** 2in1 与非图片类：系统文件选择器（保持 PC 现状）。 */
   private pickWithDocumentPicker(event: OnShowFileSelectorEvent): void {
-    const docPicker = new picker.DocumentViewPicker()
+    const ctx = getContext(this) as common.UIAbilityContext
+    const docPicker = new picker.DocumentViewPicker(ctx)
     const options: picker.DocumentSelectOptions = {
       maxSelectNumber: 9
     }
