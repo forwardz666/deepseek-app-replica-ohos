@@ -212,8 +212,9 @@ export class DeepSeekBridge {
     }
     try {
       const target = `${dir}/${DeepSeekBridge.EXPORT_SUBDIR}`
-      if (!fs.accessSync(target).valueOf()) {
-        fs.mkdirSync(target, true)
+      // accessSync 对不存在路径抛异常，直接用确保目录的辅助方法
+      if (!this.ensureDir(target)) {
+        return 'error'
       }
       const file = fs.openSync(`${target}/${name}`,
         fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC)
