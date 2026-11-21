@@ -14,6 +14,65 @@ import { DeepSeekBridge } from '../bridge/DeepSeekBridge'
 // TODO 阶段 1：日志确认 origin 语义后按 Android 版 CSP（MainActivity.java:238-240）恢复。
 const RAW_PREFIX = 'resource://rawfile/'
 
+// 手机 ArkWeb 的宽度类媒体查询按物理像素（而非 CSS vp）求值：布局宽度正确
+// （innerWidth ≈ 视口 vp），但 matchMedia/@media 断点被放大 dpr 倍比较，导致
+// 上游 Web 的 `min-width: 768px` 等桌面断点在手机（物理宽 1200+）全部误命中，
+// 呈现平板双栏布局。修复：注入脚本先探测矛盾（断点求值结果与 innerWidth 推导
+// 不一致），确认后把 CSSOM 中所有宽度断点 × devicePixelRatio 重写——在物理
+// 求值的内核里等价于按 vp 求值（vp×d 与 bp×d 比较同 vp 与 bp 比较），数学上
+// 设备无关；求值正常的内核（平板表现一致）探测不通过，不触碰样式。
+const MQ_FIX_SCRIPT: string = `(function () {
+  if (window.__DS_MQ_FIX__) return
+  window.__DS_MQ_FIX__ = true
+  function probeBroken() {
+    var w = window.innerWidth
+    var probes = [
+      ['(min-width: 768px)', w >= 768],
+      ['(max-width: 1023px)', w <= 1023],
+      ['(max-width: 439px)', w <= 439],
+      ['(min-width: 459.6px)', w >= 459.6]
+    ]
+    for (var i = 0; i < probes.length; i++) {
+      if (window.matchMedia(probes[i][0]).matches !== probes[i][1]) return true
+    }
+    return false
+  }
+  function scale(text) {
+    var d = window.devicePixelRatio || 1
+    return text.replace(/(min-width|max-width):\\s*([\\d.]+)px/g, function (m, p, v) {
+      return p + ': ' + Math.round(parseFloat(v) * d * 100) / 100 + 'px'
+    })
+  }
+  function fix() {
+    try {
+      if (!probeBroken()) return
+      var changed = 0
+      for (var s = 0; s < document.styleSheets.length; s++) {
+        var rules
+        try { rules = document.styleSheets[s].cssRules } catch (e) { continue }
+        for (var j = 0; j < rules.length; j++) {
+          var r = rules[j]
+          if (!r.media) continue
+          var mt = r.media.mediaText || ''
+          if (/(min-width|max-width):/.test(mt)) {
+            var nt = scale(mt)
+            if (nt !== mt) {
+              try { r.media.mediaText = nt; changed++ } catch (e) {}
+            }
+          }
+        }
+      }
+      if (changed > 0) console.info('[DS] media breakpoints scaled by dpr: ' + changed)
+    } catch (e) {}
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', fix)
+    window.addEventListener('load', fix)
+  } else {
+    fix()
+  }
+})()`
+
 // 对齐 Web 层 AndroidBridge 的全部桥方法（不含已废弃的 update 三个）
 const BRIDGE_METHODS: string[] = [
   'statusInset', 'buttonNavigationInset', 'systemFontScale',
@@ -198,6 +257,7 @@ struct Index {
       .domStorageAccess(true)
       .databaseAccess(true)
       .javaScriptAccess(true)
+      .javaScriptOnDocumentStart([{ script: MQ_FIX_SCRIPT, scriptRules: ['file://*', 'resource://*'] }])
       .fileAccess(true)
       .zoomAccess(false)
       .multiWindowAccess(false)
