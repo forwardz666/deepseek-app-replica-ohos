@@ -37,11 +37,11 @@ DeepSeek App Replica 的 HarmonyOS（OpenHarmony）适配版 —— 尽可能复
 | 中 / 英多语言 | ✅ | ✅ |
 | 服务协议、帮助与反馈等外链 | 应用内浏览器 | 系统浏览器打开 |
 | 语音对讲（麦克风录音） | ✅ | 未适配 |
-| 相册选图发送（多模态输入） | ✅（应用内最近照片网格 + 相册） | 部分可用（手机/平板一步直达系统相册选择器，PC 走系统文件选择器；应用内最近照片网格未适配） |
-| 保存图片到本地 | ✅（系统图库） | ✅（经系统确认弹窗保存到系统相册/图库） |
+| 相册选图发送（多模态输入） | ✅（应用内最近照片网格 + 相册） | 部分可用（手机/平板：图片按钮一步直达系统图库，文件按钮走文件管理器；PC 全部走系统文件选择器；应用内最近照片网格未适配） |
+| 保存图片到本地 | ✅（系统图库） | ✅（三级通道存入系统相册：系统保存页 → 相册确认框 → 免弹窗直写；仅 2in1 在全部不可用时退到下载目录） |
 | 返回键 / 侧滑手势状态机 | ✅（含预测性返回动画） | ✅（返回键与侧滑按 Web 协议逐层关闭；预测性返回动画未适配） |
 
-> 当前针对 **平板 / PC（2in1）设备（OpenHarmony API 26）** 开发与验证，其他设备形态未逐一测试。
+> 当前在 **手机 / 平板 / PC（2in1）设备（OpenHarmony API 26）** 上验证，其他设备形态未逐一测试。
 
 ## 下载与安装
 
@@ -64,7 +64,7 @@ DeepSeek App Replica 的 HarmonyOS（OpenHarmony）适配版 —— 尽可能复
 
 项目采用 ArkUI 原生容器承载 Web 交互内核的架构：
 
-- **ArkUI 原生层**：基于 ArkTS 与 OpenHarmony SDK 26。`entry/src/main/ets/` 包含主页面（`Index.ets`，承载 ArkWeb WebView）与 JS 桥（`DeepSeekBridge.ets`），封装系统能力：API Key 与配置的本地存储、历史对话导出（Base64 分块传输写入公共下载目录）、外链打开、下载目录权限申请等。
+- **ArkUI 原生层**：基于 ArkTS 与 OpenHarmony SDK 26。`entry/src/main/ets/` 包含主页面（`Index.ets`，承载 ArkWeb WebView）与 JS 桥（`DeepSeekBridge.ets`），封装系统能力：API Key 与配置的本地存储、历史对话导出（Base64 分块传输写入公共下载目录）、图片保存（三级通道写入系统相册）、外链打开、下载目录权限申请等。
 - **Web 交互层**：与上游 Android 版同源的 React 18 + TypeScript 构建产物（`entry/src/main/resources/resfile/web/`），包含 KaTeX、Mermaid 与 Prism.js 排版渲染，直接由 ArkWeb 从本地加载，无需网络。
 - **通信协议**：Web 层通过 `window.NativeAndroid` 风格的桥对象同步调用原生方法，原生通过 `CustomEvent` 向 Web 层派发异步事件（如导出状态、录音数据）。
 

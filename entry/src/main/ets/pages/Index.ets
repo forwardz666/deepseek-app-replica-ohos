@@ -2,6 +2,7 @@ import { webview } from '@kit.ArkWeb'
 import { common } from '@kit.AbilityKit'
 import { fileIo as fs, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
+import { camera, cameraPicker } from '@kit.CameraKit'
 import { BusinessError, deviceInfo } from '@kit.BasicServicesKit'
 import { DeepSeekBridge } from '../bridge/DeepSeekBridge'
 
@@ -85,6 +86,7 @@ const BRIDGE_METHODS: string[] = [
   'beginChatRequest', 'cancelChatRequest',
   'readAccountProfile', 'writeAccountProfile',
   'setDarkBars', 'setHandlesBack', 'setBackPreviewEnabled',
+  'setPickerKind',
   'setImageViewerFullscreen', 'requestRecentPhotos', 'prefetchRecentPhotos',
   'requestHistoryExport', 'writeHistoryExport', 'finishHistoryExport',
   'beginImageSave', 'writeImageSave', 'finishImageSave',
@@ -153,6 +155,13 @@ struct Index {
   private resourceDir: string = ''
 
   aboutToAppear(): void {
+    // toast 从 API 18 起推荐走 UIContext.getPromptAction()，全局 promptAction
+    // 在非 UI 线程上会抛异常。桥接层与此页面同生命周期，提前注入。
+    try {
+      this.bridge.attachUIContext(this.getUIContext())
+    } catch (err) {
+      console.warn(`attachUIContext failed: ${JSON.stringify(err)}`)
+    }
     // v9：改用 resfile 方案（官方 electron.hap 验证可行）：dist 放
     // resources/resfile/web/，安装时解包为真实文件，运行时直接 file:// 加载，
     // 彻底绕开 resource manager（v8 实证其对本 HAP 全瘫：media 9001001 / rawfile
@@ -333,8 +342,16 @@ struct Index {
    * Web 层按 File 对象继续原有上传流程，无需改动。
    */
   private onWebFileSelector(event: OnShowFileSelectorEvent): void {
-    const isImage = this.selectorAcceptsImagesOnly(event.fileSelector)
-    if (isImage && !event.fileSelector.isCapture() && deviceInfo.deviceType !== '2in1') {
+    // 首选 Web 显式声明的意图（点击按钮时 setPickerKind 同步写入）。
+    // 若拿不到（旧包/异常路径），退回 accept 解析。
+    const kind = this.bridge.consumePickerKind()
+    if (kind === 'camera') {
+      this.pickWithCamera(event)
+      return
+    }
+    const wantsGallery = kind === 'gallery'
+      || (kind === '' && !event.fileSelector.isCapture() && this.isGalleryPicker(event.fileSelector))
+    if (wantsGallery && deviceInfo.deviceType !== '2in1') {
       this.pickFromGallery(event)
       return
     }
@@ -342,80 +359,74 @@ struct Index {
   }
 
   /**
-   * 判断 Web 侧是否**只要图片**（严格）。
-   * 关键：文件按钮的 accept 是数百个扩展名的长列表（含 .jpg/.png 等图片后缀），
-   * 旧实现「任一项命中图片就返回 true」会把文件按钮误判成图片按钮 → 点了弹出相册。
-   * 因此这里要求 accept 中**每一项**都是图片（MIME image/* 或图片扩展名）且非空。
+   * 拍照：cameraPicker.pick（免权限，系统相机 UI）。
+   * 之前走 DocumentViewPicker，用户点「拍照」看到的是文件管理器 —— 明显不对。
    */
-  private selectorAcceptsImagesOnly(selector: FileSelectorParam): boolean {
-    const tokens: string[] = []
-    try {
-      // getMimeTypes 是 API 18 新增，旧内核调用会抛异常
-      const mimes: Array<string> = selector.getMimeTypes()
-      for (let i = 0; i < mimes.length; i++) {
-        tokens.push(mimes[i])
-      }
-    } catch (err) {
-      // 继续用 getAcceptType
+  private pickWithCamera(event: OnShowFileSelectorEvent): void {
+    const ctx = getContext(this) as common.UIAbilityContext
+    const profile: cameraPicker.PickerProfile = {
+      cameraPosition: camera.CameraPosition.CAMERA_POSITION_BACK
     }
     try {
-      const accept: Array<string> = selector.getAcceptType()
-      for (let i = 0; i < accept.length; i++) {
-        tokens.push(accept[i])
-      }
+      cameraPicker.pick(ctx, [cameraPicker.PickerMediaType.PHOTO], profile)
+        .then((result: cameraPicker.PickerResult) => {
+          // resultCode 0 = 成功；取消时 uri 为空
+          if (result.resultCode !== 0 || result.resultUri === '') {
+            event.result.handleFileList([])
+            return
+          }
+          const copied = this.copyPickedToSandbox(result.resultUri, 'shot')
+          event.result.handleFileList(copied === '' ? [] : [`file://${copied}`])
+        })
+        .catch((err: BusinessError) => {
+          console.error(`cameraPicker failed: ${JSON.stringify(err)}`)
+          event.result.handleFileList([])
+        })
+    } catch (err) {
+      console.error(`cameraPicker unavailable: ${JSON.stringify(err)}`)
+      event.result.handleFileList([])
+    }
+  }
+
+  /**
+   * 判断 Web 侧是否**只要图片**（严格，只看 getAcceptType）。
+   *
+   * 为什么不用 getMimeTypes()：v1.0.9 实测本位对 accept 为 image 通配时，
+   * getMimeTypes() 返回全通配（星号-斜杠-星号），与 getAcceptType() 合并后
+   * tokens 里出现非图片项 → 图片按钮被判成选文件，两个按钮都落到文件管理器。
+   * 而 v1.0.8 的反向证据（文件按钮的数百项扩展名被原样读出）说明
+   * getAcceptType() 是逐字返回 accept 的，可靠。
+   *
+   * 严格判据：accept 的**每一项**都必须是图片（image 通配或图片扩展名）。
+   * 文件按钮的 accept 是全格式扩展名长列表（含 .jpg/.png），必含 .pdf/.js 等
+   * 非图片项 → 返回 false，走文件管理器。
+   */
+  private isGalleryPicker(selector: FileSelectorParam): boolean {
+    let accept: Array<string> = []
+    try {
+      accept = selector.getAcceptType()
     } catch (err) {
       console.error(`getAcceptType failed: ${JSON.stringify(err)}`)
-    }
-    if (tokens.length === 0) {
       return false
     }
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i].toLowerCase().trim()
+    if (accept.length === 0) {
+      return false
+    }
+    let sawImage = false
+    for (let i = 0; i < accept.length; i++) {
+      const t = accept[i].toLowerCase().trim()
       if (t === '') {
         continue
       }
       const isImageMime = t === 'image/*' || (t.startsWith('image/') && !t.includes('*'))
       const isImageExt = t.startsWith('.') && IMAGE_EXTS.includes(t.substring(1))
       if (!isImageMime && !isImageExt) {
-        // 出现任意非图片项（.pdf/.js/.json 等）→ 这是「选择文件」，不是纯图片
+        // 出现任意非图片项（.pdf/.js/.json 等）→ 这是「选择文件」
         return false
       }
+      sawImage = true
     }
-    return true
-  }
-
-  /**
-   * 判断 Web 侧是否只要图片。ArkWeb 在不同版本下 getAcceptType() 可能返回
-   * MIME（image/*）也可能返回扩展名（.jpg），隐式 input 甚至可能返回空数组；
-   * getMimeTypes() 是 API 18 新增，旧内核调用会抛异常，因此单独 try 包裹。
-   */
-  private selectorAcceptsImages(selector: FileSelectorParam): boolean {
-    try {
-      const mimes: Array<string> = selector.getMimeTypes()
-      for (let i = 0; i < mimes.length; i++) {
-        const m = mimes[i].toLowerCase()
-        if (m === 'image/*' || m.startsWith('image/')) {
-          return true
-        }
-      }
-    } catch (err) {
-      // 旧内核无 getMimeTypes：继续用 accept 判断
-    }
-    try {
-      const accept: Array<string> = selector.getAcceptType()
-      for (let i = 0; i < accept.length; i++) {
-        const a = accept[i].toLowerCase().trim()
-        if (a === 'image/*' || a.startsWith('image/')) {
-          return true
-        }
-        if (a.startsWith('.') && IMAGE_EXTS.includes(a.substring(1))) {
-          return true
-        }
-      }
-    } catch (err) {
-      console.error(`getAcceptType failed: ${JSON.stringify(err)}`)
-    }
-    return false
+    return sawImage
   }
 
   private pickFromGallery(event: OnShowFileSelectorEvent): void {
@@ -438,27 +449,12 @@ struct Index {
         event.result.handleFileList([])
         return
       }
-      const ctx = getContext(this) as common.UIAbilityContext
-      const dir = `${ctx.cacheDir}/picked`
-      this.ensureDir(dir)
       const files: string[] = []
       const stamp = Date.now()
       for (let i = 0; i < uris.length; i++) {
-        try {
-          const src = fs.openSync(uris[i], fs.OpenMode.READ_ONLY)
-          const tmp = `${dir}/pick_${stamp}_${i}`
-          fs.copyFileSync(src.fd, tmp)
-          fs.closeSync(src.fd)
-          const ext = this.sniffImageExt(tmp)
-          const dst = `${tmp}.${ext}`
-          try {
-            fs.renameSync(tmp, dst)
-          } catch (err) {
-            // 改名失败则保留无扩展名临时名
-          }
+        const dst = this.copyPickedToSandbox(uris[i], `pick_${stamp}_${i}`)
+        if (dst !== '') {
           files.push(`file://${dst}`)
-        } catch (err) {
-          console.error(`copy picked photo failed: ${JSON.stringify(err)}`)
         }
       }
       event.result.handleFileList(files)
@@ -466,6 +462,34 @@ struct Index {
       console.error(`gallery pick failed: ${JSON.stringify(err)}`)
       event.result.handleFileList([])
     })
+  }
+
+  /**
+   * 把系统媒体 uri 复制到沙箱并补上扩展名，返回沙箱路径（失败返回 ''）。
+   * ArkWeb 无法直接读媒体 uri，必须落地成真实文件再回传 file:// 路径；
+   * uri 不携带可靠扩展名，靠魔数嗅探。
+   */
+  private copyPickedToSandbox(uri: string, nameHint: string): string {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext
+      const dir = `${ctx.cacheDir}/picked`
+      this.ensureDir(dir)
+      const src = fs.openSync(uri, fs.OpenMode.READ_ONLY)
+      const tmp = `${dir}/${nameHint}`
+      fs.copyFileSync(src.fd, tmp)
+      fs.closeSync(src.fd)
+      const dst = `${tmp}.${this.sniffImageExt(tmp)}`
+      try {
+        fs.renameSync(tmp, dst)
+        return dst
+      } catch (err) {
+        // 改名失败则返回无扩展名临时文件（Web 侧仍能读到内容）
+        return tmp
+      }
+    } catch (err) {
+      console.error(`copyPickedToSandbox failed: ${JSON.stringify(err)}`)
+      return ''
+    }
   }
 
   /** fs.accessSync 对不存在的路径会抛异常而非返回 false，必须 try/catch。 */

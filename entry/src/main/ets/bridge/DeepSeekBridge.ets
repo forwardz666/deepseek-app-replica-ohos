@@ -1,11 +1,11 @@
 import { preferences } from '@kit.ArkData'
 import { webview } from '@kit.ArkWeb'
 import { abilityAccessCtrl, common } from '@kit.AbilityKit'
-import { BusinessError } from '@kit.BasicServicesKit'
+import { BusinessError, deviceInfo } from '@kit.BasicServicesKit'
 import { util } from '@kit.ArkTS'
-import { fileIo as fs, fileUri, Environment } from '@kit.CoreFileKit'
+import { fileIo as fs, fileUri, Environment, picker } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
-import { promptAction } from '@kit.ArkUI'
+import { promptAction, UIContext } from '@kit.ArkUI'
 import { i18n } from '@kit.LocalizationKit'
 
 /**
@@ -161,6 +161,25 @@ export class DeepSeekBridge {
 
   // ===== 相册（降级：系统选图器走 onShowFileSelector，这里保持空实现） =====
 
+  /**
+   * Web 层点击「拍照/相册/文件」三个 input 前同步调用，显式声明意图。
+   * 为什么不靠 accept 判断：ArkWeb 的 getAcceptType()/getMimeTypes() 在不同
+   * 内核版本下返回值不一致（实测 getMimeTypes 对 image 通配返回全通配），
+   * 两次导致路由错乱。显式标记是唯一确定可靠的信号。
+   */
+  private pickerKind: string = ''
+
+  setPickerKind(kind: string): void {
+    this.pickerKind = kind
+  }
+
+  /** 取出并清空（每次点击只消费一次，避免影响后续意图不明的选择）。 */
+  consumePickerKind(): string {
+    const kind = this.pickerKind
+    this.pickerKind = ''
+    return kind
+  }
+
   requestRecentPhotos(): void {
   }
 
@@ -293,7 +312,11 @@ export class DeepSeekBridge {
   private imagePath: string | null = null
   private imageTitle: string | null = null
   private static readonly IMAGE_SAVES_DIR: string = 'saves'
-  private static readonly IMAGE_SUBDIR: string = 'DeepSeek Replica/Images'
+  /** 文件名里算作图片的扩展名（含 jpeg/常见派生存法） */
+  private static readonly IMAGE_NAME_EXTS: string[] =
+    ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'heic', 'heif', 'avif']
+  // PC（2in1）无系统图库入口，沿用写入下载目录
+  private static readonly IMAGE_PC_SUBDIR: string = 'DeepSeek Replica/Images'
 
   private extForMime(type: string): string {
     if (type === 'image/png') {
@@ -308,10 +331,53 @@ export class DeepSeekBridge {
     if (type === 'image/jpeg' || type === 'image/jpg') {
       return 'jpg'
     }
+    if (type === 'image/bmp' || type === 'image/x-ms-bmp') {
+      return 'bmp'
+    }
+    if (type === 'image/heic' || type === 'image/heif') {
+      return 'heic'
+    }
+    if (type === 'image/avif') {
+      return 'avif'
+    }
     return ''
   }
 
-  /** 跟随系统语言的轻提示（Web 层 i18n 不可达 native，按系统语言二选一） */
+  /**
+   * 推断图片扩展名，**永不返回空**。
+   *
+   * 为什么必须兜底：Web 层传入的 mime 来自 Blob.type，而 Blob 经 IndexedDB
+   * 往返后 type 可能丢失（空串）；文件名也可能是「图片_20241121」这种无扩展名
+   * 形式。旧实现在这两种情况下直接 return false —— Web 层立刻抛错，
+   * 用户看到的就是「点保存马上弹无法保存」，根本没机会拉起系统界面。
+   */
+  private resolveImageExt(name: string, mime: string): string {
+    // mime 可能带 charset 等参数，取分号前的部分
+    const cleanMime = mime.toLowerCase().split(';')[0].trim()
+    const byMime = this.extForMime(cleanMime)
+    if (byMime !== '') {
+      return byMime
+    }
+    const dot = name.lastIndexOf('.')
+    if (dot > 0) {
+      const e = name.substring(dot + 1).toLowerCase()
+      if (DeepSeekBridge.IMAGE_NAME_EXTS.includes(e)) {
+        return e === 'jpeg' ? 'jpg' : e
+      }
+    }
+    // 最终兜底：按 jpeg 处理（相册侧按魔数识别，扩展名不匹配也能显示）
+    return 'jpg'
+  }
+
+  /**
+   * 跟随系统语言的轻提示（Web 层 i18n 不可达 native，按系统语言二选一）。
+   *
+   * 必须全程 try/catch：全局 promptAction.showToast 在 API 18 起已废弃，
+   * 某些版本由非 UI 线程调用会直接抛异常。这个异常若是从 finishImageSave
+   * 里冒出去，就会顺着 javaScriptProxy 抛回 Web —— Web 侧立刻显示
+   * 「无法保存图片」，而系统弹窗还没机会出现。这正是「点保存马上报错、
+   * 也不出保存菜单」的成因，所以提示失败绝不允许影响主流程。
+   */
   private toast(msgZh: string, msgEn: string): void {
     let zh = true
     try {
@@ -319,7 +385,28 @@ export class DeepSeekBridge {
     } catch (err) {
       // 默认中文
     }
-    promptAction.showToast({ message: zh ? msgZh : msgEn, duration: 2000 })
+    const message = zh ? msgZh : msgEn
+    const ctx = this.uiContext
+    if (ctx !== null) {
+      try {
+        ctx.getPromptAction().showToast({ message: message, duration: 2000 })
+        return
+      } catch (err) {
+        console.warn(`toast via UIContext failed: ${JSON.stringify(err)}`)
+      }
+    }
+    try {
+      promptAction.showToast({ message: message, duration: 2000 })
+    } catch (err) {
+      console.warn(`toast failed: ${JSON.stringify(err)}`)
+    }
+  }
+
+  /** 由 Index 在页面出现时注入，供 toast 走推荐的 UIContext 通道。 */
+  private uiContext: UIContext | null = null
+
+  attachUIContext(ctx: UIContext): void {
+    this.uiContext = ctx
   }
 
   /**
@@ -343,41 +430,27 @@ export class DeepSeekBridge {
     }
   }
 
+  /**
+   * 建立沙箱临时文件，等待 Web 分块写入。
+   *
+   * 旧实现在 name 无扩展名 / mime 不在白名单时直接 return false，Web 层立刻
+   * 提示「无法保存图片」—— 用户看不到任何系统界面，这就是「点了没有作用」。
+   * 现在扩展名一律兜底推断，只有「建目录/建文件确实失败」才返回 false。
+   */
   beginImageSave(name: string, mime: string): boolean {
-    let fileName = name.replace(/[/\\]+/g, '_').trim()
-    let type = mime
-    if (!type.startsWith('image/')) {
-      // mime 缺省时从扩展名推断（对齐 Android ImageSave）
-      const dot = fileName.lastIndexOf('.')
-      if (dot < 0) {
-        return false
-      }
-      const ext = fileName.substring(dot + 1).toLowerCase()
-      if (ext === 'png') {
-        type = 'image/png'
-      } else if (ext === 'webp') {
-        type = 'image/webp'
-      } else if (ext === 'gif') {
-        type = 'image/gif'
-      } else if (ext === 'jpg' || ext === 'jpeg') {
-        type = 'image/jpeg'
-      } else {
-        return false
-      }
+    const safeName = (name || '').replace(/[/\\]+/g, '_').trim()
+    const ext = this.resolveImageExt(safeName, mime || '')
+    // 去掉已有扩展名后作为资产名（相册展示名不带时间戳）
+    const dot = safeName.lastIndexOf('.')
+    let stem = dot > 0 ? safeName.substring(0, dot) : safeName
+    if (stem === '' || stem === '.' || stem === '..') {
+      stem = `image_${Date.now()}`
     }
-    const ext = this.extForMime(type)
-    if (ext === '') {
-      return false
-    }
-    // 相册资产 title 必须带扩展名；文件名缺省时按 mime 补全
-    const dot = fileName.lastIndexOf('.')
-    const hasExt = dot > 0 && ['png', 'webp', 'gif', 'jpg', 'jpeg']
-      .includes(fileName.substring(dot + 1).toLowerCase())
-    if (!hasExt) {
-      fileName = `${fileName}.${ext}`
-    }
-    const sanitized = this.sanitizeExportName(fileName)
+    const cleanTitle = `${stem}.${ext}`
+    const tempName = `${stem}_${Date.now()}.${ext}`
+    const sanitized = this.sanitizeExportName(tempName)
     if (sanitized === null) {
+      console.error(`beginImageSave: sanitize failed for "${tempName}"`)
       return false
     }
     try {
@@ -389,7 +462,7 @@ export class DeepSeekBridge {
         fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC)
       this.imageFd = file.fd
       this.imagePath = `${dir}/${sanitized}`
-      this.imageTitle = sanitized
+      this.imageTitle = cleanTitle
       return true
     } catch (err) {
       console.error(`beginImageSave failed: ${JSON.stringify(err)}`)
@@ -412,10 +485,58 @@ export class DeepSeekBridge {
     }
   }
 
+  /** 读文件头魔数，返回真实图片扩展名（永远返回非空值）。 */
+  private sniffImageExt(path: string): string {
+    try {
+      const file = fs.openSync(path, fs.OpenMode.READ_ONLY)
+      const buf = new ArrayBuffer(16)
+      const read = fs.readSync(file.fd, buf, { offset: 0, length: 16 })
+      fs.closeSync(file.fd)
+      if (read < 4) {
+        return 'jpg'
+      }
+      const b = new Uint8Array(buf)
+      if (b[0] === 0xFF && b[1] === 0xD8) {
+        return 'jpg'
+      }
+      if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E) {
+        return 'png'
+      }
+      if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) {
+        return 'gif'
+      }
+      if (b[0] === 0x42 && b[1] === 0x4D) {
+        return 'bmp'
+      }
+      if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46) {
+        return 'webp'
+      }
+      if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+        return 'heic'
+      }
+      return 'jpg'
+    } catch (err) {
+      console.error(`sniffImageExt failed: ${JSON.stringify(err)}`)
+      return 'jpg'
+    }
+  }
+
   finishImageSave(keep: boolean): boolean {
+    // 整个方法绝不允许向 Web 抛异常：桥方法一旦抛错，Web 层会立刻显示
+    // 「无法保存图片」，而系统确认框还没来得及出现 —— 用户看到的就是
+    // 「点保存马上报错，也没弹出保存菜单」。
+    try {
+      return this.finishImageSaveGuarded(keep)
+    } catch (err) {
+      console.error(`finishImageSave crashed: ${JSON.stringify(err)}`)
+      return false
+    }
+  }
+
+  private finishImageSaveGuarded(keep: boolean): boolean {
     const fd = this.imageFd
-    const path = this.imagePath
-    const title = this.imageTitle
+    let path = this.imagePath
+    let title = this.imageTitle
     this.imageFd = -1
     this.imagePath = null
     this.imageTitle = null
@@ -432,22 +553,77 @@ export class DeepSeekBridge {
       this.removeTempImage(path)
       return false
     }
-    // 保存策略（顺序执行，结果如实告知）：
-    // 1) 先复制到公共 Download/DeepSeek Replica/Images/ —— 有权限时必定成功，
-    //    保证用户一定拿得到文件（这也是 PC 上原有的可靠路径）
-    // 2) 若第 1 步失败（无下载权限），再走系统相册确认框
-    // 3) 若文件已在下载目录，仍尝试入相册（用户可用系统图库统一管理），
-    //    相册失败不影响「已保存」结论
-    const savedToDownload = this.copyToDownload(title, path)
-    if (savedToDownload) {
-      // 已落地：尝试入相册（失败静默，不打扰用户）
-      this.tryAddToGallery(title, path, false)
-      this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
-    } else {
-      // 无下载权限：走相册弹窗（免权限），失败再申请权限兜底
-      this.saveToGallery(title, path)
+    // 空文件说明 Web 侧一个字节都没写进来（分块失败/Blob 读取失败），
+    // 这种文件进相册只会在图库里留一张坏图，提前拦掉并明确告知。
+    let size = 0
+    try {
+      size = fs.statSync(path).size
+    } catch (err) {
+      console.error(`stat image failed: ${JSON.stringify(err)}`)
     }
+    if (size <= 0) {
+      this.toast('保存失败：图片数据为空', 'Failed: empty image data')
+      this.dispatchEvent('android-image-saved', 'error:empty')
+      this.removeTempImage(path)
+      return true
+    }
+    // Web 层给的 mime/文件名可能丢失或不准（Blob 经 IndexedDB 往返会掉 type），
+    // 这里按字节魔数纠正扩展名，否则媒体库会因「扩展名与实际内容不符」拒绝创建。
+    const realExt = this.sniffImageExt(path)
+    const slash = path.lastIndexOf('/')
+    const dot = path.lastIndexOf('.')
+    if (dot > slash) {
+      const fixed = `${path.substring(0, dot)}.${realExt}`
+      if (fixed !== path) {
+        try {
+          fs.renameSync(path, fixed)
+          path = fixed
+        } catch (err) {
+          console.error(`rename to real ext failed: ${JSON.stringify(err)}`)
+        }
+      }
+    }
+    const tDot = title.lastIndexOf('.')
+    if (tDot > 0) {
+      title = `${title.substring(0, tDot)}.${realExt}`
+    }
+    // 全平台统一优先存进系统图库（用户明确要求：不要图库和下载两条不一致的路径）。
+    // 图库通道确实不可用时（如部分 PC 形态没有媒体库服务），2in1 再退回下载目录，
+    // 其余设备报明确错误 —— 绝不再静默写到一个用户看不见的地方。
+    this.saveToGallery(title, path, deviceInfo.deviceType === '2in1')
     return true
+  }
+
+  /**
+   * PC 专用：写入 下载/DeepSeek Replica/Images。
+   * 仅在图库三条通道都不可用时作为 2in1 的最后退路，确保用户一定能找到文件。
+   */
+  private saveToDownloadForPc(title: string, path: string): void {
+    const dir = this.pickDownloadDir()
+    if (dir === null) {
+      this.toast('保存失败：无法访问下载目录', 'Failed: no download dir')
+      this.dispatchEvent('android-image-saved', 'error:download')
+      this.removeTempImage(path)
+      return
+    }
+    const target = `${dir}/${DeepSeekBridge.IMAGE_PC_SUBDIR}`
+    if (!this.ensureDir(target)) {
+      this.toast('保存失败：无法创建目录', 'Failed: cannot create dir')
+      this.dispatchEvent('android-image-saved', 'error:download')
+      this.removeTempImage(path)
+      return
+    }
+    try {
+      fs.copyFileSync(path, `${target}/${title}`)
+      this.toast('已保存到「下载/DeepSeek Replica/Images」', 'Saved to Downloads')
+      this.dispatchEvent('android-image-saved', 'ok')
+      this.removeTempImage(path)
+    } catch (err) {
+      console.error(`saveToDownloadForPc failed: ${JSON.stringify(err)}`)
+      this.toast('保存失败', 'Failed to save')
+      this.dispatchEvent('android-image-saved', 'error:download')
+      this.removeTempImage(path)
+    }
   }
 
   private removeTempImage(path: string | null): void {
@@ -462,114 +638,206 @@ export class DeepSeekBridge {
   }
 
   /**
-   * 无下载目录权限时的主路径：弹系统相册确认框（免权限）。
-   * 用户确认 → 入相册；取消/失败 → 申请下载权限后复制到下载目录（如实告知结果）。
+   * 把沙箱里的图片存进系统相册。
+   *
+   * 为什么把「系统保存页」放第一条：showAssetsCreationDialog 有隐式的
+   * 「必须由用户在原生组件上点击触发」限制，从 ArkWeb 的 JS 桥回调里调用时
+   * 系统会静默返回空数组（既不弹窗也不报错）—— 这正是用户看到的
+   * 「无法引出系统的图片保存菜单」。而 picker 的保存页是独立的系统 Ability，
+   * 从 UIAbility 上下文就能拉起，不受该限制。
+   *
+   * 通道顺序：
+   * 1. picker.PhotoViewPicker.save —— 系统「保存到图片」页（用户可见、可确认）
+   * 2. showAssetsCreationDialog —— 直接弹「保存到相册」确认框
+   * 3. MediaAssetChangeRequest.applyChanges —— 免弹窗直写（多数机型 201）
+   * 4. 2in1 退回下载目录；其余设备明确报错
    */
-  private saveToGallery(title: string, path: string): void {
-    this.tryAddToGallery(title, path, true)
+  private saveToGallery(title: string, path: string, allowDownloadFallback: boolean): void {
+    this.toast('正在保存到相册…', 'Saving to gallery…')
+    this.saveViaPickerPage(title, path, allowDownloadFallback)
   }
 
   /**
-   * 尝试把图片加入系统相册（showAssetsCreationDialog，免权限）。
-   * loud=false 时失败静默（文件已另行保存，不打扰用户）；
-   * loud=true 时失败会走下载目录兜底并 toast 结果。
+   * 通道 1：系统「保存到图片」页（picker.PhotoViewPicker.save）。
+   *
+   * 必须用带 context 的构造函数 —— 无参构造是 @deprecated 的「可能失败」用法，
+   * 在部分版本上直接抛异常，界面就完全出不来。
    */
-  private tryAddToGallery(title: string, path: string, loud: boolean): void {
-    let helper: photoAccessHelper.PhotoAccessHelper
+  private saveViaPickerPage(title: string, path: string, allowDownloadFallback: boolean): void {
+    const self = this
+    let photoPicker: picker.PhotoViewPicker
     try {
-      helper = photoAccessHelper.getPhotoAccessHelper(this.context)
+      photoPicker = new picker.PhotoViewPicker(this.context)
     } catch (err) {
-      console.error(`getPhotoAccessHelper failed: ${JSON.stringify(err)}`)
-      if (loud) {
-        this.fallbackToDownload(title, path, false)
-      }
+      console.error(`PhotoViewPicker unavailable: ${JSON.stringify(err)}`)
+      this.saveViaCreationDialog(title, path, allowDownloadFallback)
       return
     }
-    const dot = title.lastIndexOf('.')
-    const config: photoAccessHelper.PhotoCreationConfig = {
-      title: title,
-      fileNameExtension: dot >= 0 ? title.substring(dot + 1) : 'jpg',
-      photoType: photoAccessHelper.PhotoType.IMAGE
-    }
-    let srcUri = ''
+    const options: picker.PhotoSaveOptions = { newFileNames: [title] }
     try {
-      srcUri = fileUri.getUriFromPath(path)
-    } catch (err) {
-      console.error(`getUriFromPath failed: ${JSON.stringify(err)}`)
-      if (loud) {
-        this.fallbackToDownload(title, path, false)
-      }
-      return
-    }
-    helper.showAssetsCreationDialog([srcUri], [config]).then((uris: Array<string>) => {
-      if (uris.length > 0) {
-        if (loud) {
-          this.toast('已保存到系统相册', 'Saved to gallery')
+      photoPicker.save(options).then((uris: Array<string>) => {
+        if (uris.length === 0) {
+          // 系统保存页返回空 = 用户主动取消，不算失败，不提示错误。
+          self.toast('已取消保存', 'Save cancelled')
+          self.dispatchEvent('android-image-saved', 'cancel')
+          self.removeTempImage(path)
+          return
         }
-      } else if (loud) {
-        // 用户取消或系统未写入：回退到下载目录
-        this.fallbackToDownload(title, path, false)
-      }
-      // 静默模式或已成功：清理临时文件
-      this.removeTempImage(path)
-    }).catch((err: BusinessError) => {
-      console.error(`showAssetsCreationDialog failed: ${JSON.stringify(err)}`)
-      if (loud) {
-        this.fallbackToDownload(title, path, false)
-      } else {
-        this.removeTempImage(path)
-      }
-    })
+        if (self.copyIntoUri(path, uris[0])) {
+          self.toast('已保存到相册', 'Saved to photos')
+          self.dispatchEvent('android-image-saved', 'ok')
+          self.removeTempImage(path)
+        } else {
+          self.toast('保存失败：写入相册出错', 'Failed: cannot write to gallery')
+          self.dispatchEvent('android-image-saved', 'error:write')
+        }
+      }).catch((err: BusinessError) => {
+        console.error(`PhotoViewPicker.save failed: ${JSON.stringify(err)}`)
+        // 保存页拉不起来 → 试直接弹确认框
+        self.saveViaCreationDialog(title, path, allowDownloadFallback)
+      })
+    } catch (err) {
+      console.error(`PhotoViewPicker.save threw: ${JSON.stringify(err)}`)
+      this.saveViaCreationDialog(title, path, allowDownloadFallback)
+    }
   }
 
-  /** 把临时图片复制到公共下载目录（兜底路径，需 READ_WRITE_DOWNLOAD_DIRECTORY）。 */
-  private copyToDownload(title: string, path: string): boolean {
-    const dir = this.pickDownloadDir()
-    if (dir === null) {
-      return false
-    }
-    const target = `${dir}/${DeepSeekBridge.IMAGE_SUBDIR}`
-    if (!this.ensureDir(target)) {
-      return false
-    }
+  /** 把沙箱文件分块写入 picker 返回的可写 uri。 */
+  private copyIntoUri(srcPath: string, dstUri: string): boolean {
+    let srcFd = -1
+    let dstFd = -1
     try {
-      fs.copyFileSync(path, `${target}/${title}`)
+      srcFd = fs.openSync(srcPath, fs.OpenMode.READ_ONLY).fd
+      dstFd = fs.openSync(dstUri, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC).fd
+      const buf = new ArrayBuffer(64 * 1024)
+      let read = fs.readSync(srcFd, buf)
+      while (read > 0) {
+        fs.writeSync(dstFd, buf.slice(0, read))
+        read = fs.readSync(srcFd, buf)
+      }
+      fs.fsyncSync(dstFd)
       return true
     } catch (err) {
-      console.error(`copyToDownload failed: ${JSON.stringify(err)}`)
+      console.error(`copyIntoUri failed: ${JSON.stringify(err)}`)
       return false
+    } finally {
+      if (srcFd >= 0) {
+        try {
+          fs.closeSync(srcFd)
+        } catch (err) {
+          // 忽略
+        }
+      }
+      if (dstFd >= 0) {
+        try {
+          fs.closeSync(dstFd)
+        } catch (err) {
+          // 忽略
+        }
+      }
     }
   }
 
-  /** 兜底保存：无下载目录权限时先申请，再复制；结果经 toast 如实告知。 */
-  private fallbackToDownload(title: string, path: string, hadPermission: boolean): void {
-    if (this.copyToDownload(title, path)) {
-      this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
-      this.removeTempImage(path)
+  /**
+   * 通道 2：showAssetsCreationDialog 直接弹「保存到相册」确认框。
+   * PhotoCreationConfig.title 必须是**不含扩展名**的资产名，扩展名单独经
+   * fileNameExtension 提供。传 'a.png' + 'png' 会让系统创建资产失败。
+   */
+  private saveViaCreationDialog(title: string, path: string, allowDownloadFallback: boolean): void {
+    const self = this
+    const dot = title.lastIndexOf('.')
+    const baseName = dot > 0 ? title.substring(0, dot) : title
+    const ext = dot > 0 ? title.substring(dot + 1).toLowerCase() : 'jpg'
+    let helper: photoAccessHelper.PhotoAccessHelper | null = null
+    let srcUri = ''
+    try {
+      helper = photoAccessHelper.getPhotoAccessHelper(this.context)
+      srcUri = fileUri.getUriFromPath(path)
+    } catch (err) {
+      console.error(`saveViaCreationDialog prep failed: ${JSON.stringify(err)}`)
+    }
+    if (helper === null || srcUri === '') {
+      this.saveViaChangeRequest(title, path, allowDownloadFallback)
       return
     }
-    if (hadPermission) {
-      this.toast('保存失败', 'Failed to save')
-      this.removeTempImage(path)
+    const config: photoAccessHelper.PhotoCreationConfig = {
+      title: baseName,
+      fileNameExtension: ext,
+      photoType: photoAccessHelper.PhotoType.IMAGE,
+      subtype: photoAccessHelper.PhotoSubtype.DEFAULT
+    }
+    // 桥方法由 ArkWeb 的 JS 线程同步调用，直接拉起系统弹窗会被静默丢弃，
+    // 用 setTimeout 切到下一轮事件循环再弹。
+    setTimeout(() => {
+      const h = helper
+      if (h === null) {
+        self.saveViaChangeRequest(title, path, allowDownloadFallback)
+        return
+      }
+      try {
+        h.showAssetsCreationDialog([srcUri], [config]).then((uris: Array<string>) => {
+          console.info(`showAssetsCreationDialog result: ${JSON.stringify(uris)}`)
+          if (uris.length > 0) {
+            self.toast('已保存到相册', 'Saved to photos')
+            self.dispatchEvent('android-image-saved', 'ok')
+            self.removeTempImage(path)
+            return
+          }
+          // 空数组：无 UI 服务或用户取消。继续往下试免弹窗直写。
+          console.warn('showAssetsCreationDialog returned empty, trying direct create')
+          self.saveViaChangeRequest(title, path, allowDownloadFallback)
+        }).catch((err: BusinessError) => {
+          console.error(`showAssetsCreationDialog failed: ${JSON.stringify(err)}`)
+          self.saveViaChangeRequest(title, path, allowDownloadFallback)
+        })
+      } catch (err) {
+        console.error(`showAssetsCreationDialog threw: ${JSON.stringify(err)}`)
+        self.saveViaChangeRequest(title, path, allowDownloadFallback)
+      }
+    }, 0)
+  }
+
+  /**
+   * 通道 3：createImageAssetRequest + applyChanges。
+   * 需要 WRITE_IMAGEVIDEO，普通应用通常拿不到（201），但成本极低，留作兜底。
+   */
+  private saveViaChangeRequest(title: string, path: string, allowDownloadFallback: boolean): void {
+    const self = this
+    const dot = title.lastIndexOf('.')
+    const baseName = dot > 0 ? title.substring(0, dot) : title
+    try {
+      const helper = photoAccessHelper.getPhotoAccessHelper(this.context)
+      const srcUri = fileUri.getUriFromPath(path)
+      const request = photoAccessHelper.MediaAssetChangeRequest.createImageAssetRequest(
+        this.context, srcUri)
+      request.setTitle(baseName)
+      helper.applyChanges(request).then(() => {
+        console.info('applyChanges ok')
+        self.toast('已保存到相册', 'Saved to photos')
+        self.dispatchEvent('android-image-saved', 'ok')
+        self.removeTempImage(path)
+      }).catch((err: BusinessError) => {
+        console.error(`applyChanges failed: ${JSON.stringify(err)}`)
+        self.galleryUnavailable(title, path, allowDownloadFallback, err.code)
+      })
+    } catch (err) {
+      console.error(`createImageAssetRequest failed: ${JSON.stringify(err)}`)
+      this.galleryUnavailable(title, path, allowDownloadFallback, (err as BusinessError).code)
+    }
+  }
+
+  /** 三条图库通道都不可用：2in1 退回下载目录（用户可见），其余明确报错。 */
+  private galleryUnavailable(title: string, path: string, allowDownloadFallback: boolean,
+    code?: number): void {
+    if (allowDownloadFallback) {
+      this.saveToDownloadForPc(title, path)
       return
     }
-    // 未授权：申请后重试一次（用户首次拒绝过的场景）
-    abilityAccessCtrl.createAtManager()
-      .requestPermissionsFromUser(this.context, ['ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY'])
-      .then((result) => {
-        const granted = result.authResults.length > 0 && result.authResults[0] === 0
-        if (granted && this.copyToDownload(title, path)) {
-          this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
-        } else {
-          this.toast('保存失败：请在系统设置中授予文件权限', 'Failed: grant file permission')
-        }
-        this.removeTempImage(path)
-      })
-      .catch((err: BusinessError) => {
-        console.error(`fallback permission failed: ${JSON.stringify(err)}`)
-        this.toast('保存失败', 'Failed to save')
-        this.removeTempImage(path)
-      })
+    const suffix = code === undefined ? '' : `（${code}）`
+    const suffixEn = code === undefined ? '' : ` (${code})`
+    this.toast(`保存失败：相册不可用${suffix}`, `Gallery unavailable${suffixEn}`)
+    this.dispatchEvent('android-image-saved', code === undefined ? 'error' : `error:${code}`)
+    this.removeTempImage(path)
   }
 
   // ===== 录音（阶段 2 实现） =====
