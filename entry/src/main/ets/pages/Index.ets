@@ -146,7 +146,6 @@ struct Index {
   @State diag2: string = ''
   @State diag3: string = ''
   @State diagErr: boolean = false
-  @State diagPicker: string = ''
   @State webSrc: string = 'about:blank'
   controller: webview.WebviewController = new webview.WebviewController()
   private bridge: DeepSeekBridge =
@@ -216,13 +215,6 @@ struct Index {
 
   build() {
     Column() {
-      if (this.diagPicker !== '') {
-        Text(this.diagPicker)
-          .width('100%')
-          .fontSize(9)
-          .fontColor('#0A59F7')
-          .padding({ left: 4, right: 4, top: 2, bottom: 2 })
-      }
       Web({ src: this.webSrc, controller: this.controller })
       .javaScriptProxy({
         object: this.bridge,
@@ -341,36 +333,55 @@ struct Index {
    * Web 层按 File 对象继续原有上传流程，无需改动。
    */
   private onWebFileSelector(event: OnShowFileSelectorEvent): void {
-    // 临时诊断：把 ArkWeb 传回的真实 accept/mime/capture 打到屏幕上
-    let info = ''
-    try {
-      const accept: Array<string> = event.fileSelector.getAcceptType()
-      info = `accept=[${accept.join('|')}]`
-    } catch (err) {
-      info = 'accept:ERR'
-    }
-    try {
-      const mimes: Array<string> = event.fileSelector.getMimeTypes()
-      info = `${info} mime=[${mimes.join('|')}]`
-    } catch (err) {
-      info = `${info} mime:ERR`
-    }
-    try {
-      info = `${info} cap=${event.fileSelector.isCapture()} mode=${event.fileSelector.getMode()}`
-    } catch (err) {
-      info = `${info} cap:ERR`
-    }
-    const isImage = this.selectorAcceptsImages(event.fileSelector)
-    this.diagPicker = `${info} img=${isImage} dev=${deviceInfo.deviceType}`
-    this.pickRoute(event, isImage)
-  }
-
-  private pickRoute(event: OnShowFileSelectorEvent, isImage: boolean): void {
+    const isImage = this.selectorAcceptsImagesOnly(event.fileSelector)
     if (isImage && !event.fileSelector.isCapture() && deviceInfo.deviceType !== '2in1') {
       this.pickFromGallery(event)
       return
     }
     this.pickWithDocumentPicker(event)
+  }
+
+  /**
+   * 判断 Web 侧是否**只要图片**（严格）。
+   * 关键：文件按钮的 accept 是数百个扩展名的长列表（含 .jpg/.png 等图片后缀），
+   * 旧实现「任一项命中图片就返回 true」会把文件按钮误判成图片按钮 → 点了弹出相册。
+   * 因此这里要求 accept 中**每一项**都是图片（MIME image/* 或图片扩展名）且非空。
+   */
+  private selectorAcceptsImagesOnly(selector: FileSelectorParam): boolean {
+    const tokens: string[] = []
+    try {
+      // getMimeTypes 是 API 18 新增，旧内核调用会抛异常
+      const mimes: Array<string> = selector.getMimeTypes()
+      for (let i = 0; i < mimes.length; i++) {
+        tokens.push(mimes[i])
+      }
+    } catch (err) {
+      // 继续用 getAcceptType
+    }
+    try {
+      const accept: Array<string> = selector.getAcceptType()
+      for (let i = 0; i < accept.length; i++) {
+        tokens.push(accept[i])
+      }
+    } catch (err) {
+      console.error(`getAcceptType failed: ${JSON.stringify(err)}`)
+    }
+    if (tokens.length === 0) {
+      return false
+    }
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i].toLowerCase().trim()
+      if (t === '') {
+        continue
+      }
+      const isImageMime = t === 'image/*' || (t.startsWith('image/') && !t.includes('*'))
+      const isImageExt = t.startsWith('.') && IMAGE_EXTS.includes(t.substring(1))
+      if (!isImageMime && !isImageExt) {
+        // 出现任意非图片项（.pdf/.js/.json 等）→ 这是「选择文件」，不是纯图片
+        return false
+      }
+    }
+    return true
   }
 
   /**

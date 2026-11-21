@@ -3,7 +3,7 @@ import { webview } from '@kit.ArkWeb'
 import { abilityAccessCtrl, common } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { util } from '@kit.ArkTS'
-import { fileIo as fs, fileUri } from '@kit.CoreFileKit'
+import { fileIo as fs, fileUri, Environment } from '@kit.CoreFileKit'
 import { photoAccessHelper } from '@kit.MediaLibraryKit'
 import { promptAction } from '@kit.ArkUI'
 import { i18n } from '@kit.LocalizationKit'
@@ -176,9 +176,18 @@ export class DeepSeekBridge {
     ['/storage/Users/100/Download', '/storage/Users/currentUser/Download']
 
   private pickDownloadDir(): string | null {
+    // 优先官方 API（自动适配手机/平板/PC 的用户目录）
+    try {
+      const dir = Environment.getUserDownloadDir()
+      if (dir !== '' && fs.accessSync(dir)) {
+        return dir
+      }
+    } catch (err) {
+      // 无权限或未挂载 → 退回候选路径探测
+    }
     for (const base of DeepSeekBridge.DOWNLOAD_CANDIDATES) {
       try {
-        if (fs.accessSync(base).valueOf()) {
+        if (fs.accessSync(base)) {
           return base
         }
       } catch (err) {
@@ -284,6 +293,7 @@ export class DeepSeekBridge {
   private imagePath: string | null = null
   private imageTitle: string | null = null
   private static readonly IMAGE_SAVES_DIR: string = 'saves'
+  private static readonly IMAGE_SUBDIR: string = 'DeepSeek Replica/Images'
 
   private extForMime(type: string): string {
     if (type === 'image/png') {
@@ -422,8 +432,21 @@ export class DeepSeekBridge {
       this.removeTempImage(path)
       return false
     }
-    // 文件已完整落盘：弹系统相册保存对话框（异步），结果经 toast 反馈
-    this.saveToGallery(title, path)
+    // 保存策略（顺序执行，结果如实告知）：
+    // 1) 先复制到公共 Download/DeepSeek Replica/Images/ —— 有权限时必定成功，
+    //    保证用户一定拿得到文件（这也是 PC 上原有的可靠路径）
+    // 2) 若第 1 步失败（无下载权限），再走系统相册确认框
+    // 3) 若文件已在下载目录，仍尝试入相册（用户可用系统图库统一管理），
+    //    相册失败不影响「已保存」结论
+    const savedToDownload = this.copyToDownload(title, path)
+    if (savedToDownload) {
+      // 已落地：尝试入相册（失败静默，不打扰用户）
+      this.tryAddToGallery(title, path, false)
+      this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
+    } else {
+      // 无下载权限：走相册弹窗（免权限），失败再申请权限兜底
+      this.saveToGallery(title, path)
+    }
     return true
   }
 
@@ -439,37 +462,114 @@ export class DeepSeekBridge {
   }
 
   /**
-   * showAssetsCreationDialog：系统提供的媒体资产保存确认对话框，三方应用免权限。
-   * 传入沙箱临时文件的 file:// uri，用户确认后图片进入系统相册（图库可见）；
-   * 取消/失败均清理临时文件。
+   * 无下载目录权限时的主路径：弹系统相册确认框（免权限）。
+   * 用户确认 → 入相册；取消/失败 → 申请下载权限后复制到下载目录（如实告知结果）。
    */
   private saveToGallery(title: string, path: string): void {
+    this.tryAddToGallery(title, path, true)
+  }
+
+  /**
+   * 尝试把图片加入系统相册（showAssetsCreationDialog，免权限）。
+   * loud=false 时失败静默（文件已另行保存，不打扰用户）；
+   * loud=true 时失败会走下载目录兜底并 toast 结果。
+   */
+  private tryAddToGallery(title: string, path: string, loud: boolean): void {
+    let helper: photoAccessHelper.PhotoAccessHelper
     try {
-      const helper = photoAccessHelper.getPhotoAccessHelper(this.context)
-      const dot = title.lastIndexOf('.')
-      const config: photoAccessHelper.PhotoCreationConfig = {
-        title: title,
-        fileNameExtension: dot >= 0 ? title.substring(dot + 1) : 'jpg',
-        photoType: photoAccessHelper.PhotoType.IMAGE
+      helper = photoAccessHelper.getPhotoAccessHelper(this.context)
+    } catch (err) {
+      console.error(`getPhotoAccessHelper failed: ${JSON.stringify(err)}`)
+      if (loud) {
+        this.fallbackToDownload(title, path, false)
       }
-      const srcUri = fileUri.getUriFromPath(path)
-      helper.showAssetsCreationDialog([srcUri], [config]).then((uris: Array<string>) => {
-        if (uris.length > 0) {
+      return
+    }
+    const dot = title.lastIndexOf('.')
+    const config: photoAccessHelper.PhotoCreationConfig = {
+      title: title,
+      fileNameExtension: dot >= 0 ? title.substring(dot + 1) : 'jpg',
+      photoType: photoAccessHelper.PhotoType.IMAGE
+    }
+    let srcUri = ''
+    try {
+      srcUri = fileUri.getUriFromPath(path)
+    } catch (err) {
+      console.error(`getUriFromPath failed: ${JSON.stringify(err)}`)
+      if (loud) {
+        this.fallbackToDownload(title, path, false)
+      }
+      return
+    }
+    helper.showAssetsCreationDialog([srcUri], [config]).then((uris: Array<string>) => {
+      if (uris.length > 0) {
+        if (loud) {
           this.toast('已保存到系统相册', 'Saved to gallery')
+        }
+      } else if (loud) {
+        // 用户取消或系统未写入：回退到下载目录
+        this.fallbackToDownload(title, path, false)
+      }
+      // 静默模式或已成功：清理临时文件
+      this.removeTempImage(path)
+    }).catch((err: BusinessError) => {
+      console.error(`showAssetsCreationDialog failed: ${JSON.stringify(err)}`)
+      if (loud) {
+        this.fallbackToDownload(title, path, false)
+      } else {
+        this.removeTempImage(path)
+      }
+    })
+  }
+
+  /** 把临时图片复制到公共下载目录（兜底路径，需 READ_WRITE_DOWNLOAD_DIRECTORY）。 */
+  private copyToDownload(title: string, path: string): boolean {
+    const dir = this.pickDownloadDir()
+    if (dir === null) {
+      return false
+    }
+    const target = `${dir}/${DeepSeekBridge.IMAGE_SUBDIR}`
+    if (!this.ensureDir(target)) {
+      return false
+    }
+    try {
+      fs.copyFileSync(path, `${target}/${title}`)
+      return true
+    } catch (err) {
+      console.error(`copyToDownload failed: ${JSON.stringify(err)}`)
+      return false
+    }
+  }
+
+  /** 兜底保存：无下载目录权限时先申请，再复制；结果经 toast 如实告知。 */
+  private fallbackToDownload(title: string, path: string, hadPermission: boolean): void {
+    if (this.copyToDownload(title, path)) {
+      this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
+      this.removeTempImage(path)
+      return
+    }
+    if (hadPermission) {
+      this.toast('保存失败', 'Failed to save')
+      this.removeTempImage(path)
+      return
+    }
+    // 未授权：申请后重试一次（用户首次拒绝过的场景）
+    abilityAccessCtrl.createAtManager()
+      .requestPermissionsFromUser(this.context, ['ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY'])
+      .then((result) => {
+        const granted = result.authResults.length > 0 && result.authResults[0] === 0
+        if (granted && this.copyToDownload(title, path)) {
+          this.toast('已保存到「下载/DeepSeek Replica」', 'Saved to Downloads')
         } else {
-          this.toast('已取消保存', 'Save cancelled')
+          this.toast('保存失败：请在系统设置中授予文件权限', 'Failed: grant file permission')
         }
         this.removeTempImage(path)
-      }).catch((err: BusinessError) => {
-        console.error(`saveToGallery failed: ${JSON.stringify(err)}`)
-        this.toast('保存到相册失败', 'Failed to save')
+      })
+      .catch((err: BusinessError) => {
+        console.error(`fallback permission failed: ${JSON.stringify(err)}`)
+        this.toast('保存失败', 'Failed to save')
         this.removeTempImage(path)
       })
-    } catch (err) {
-      console.error(`saveToGallery setup failed: ${JSON.stringify(err)}`)
-      this.toast('保存到相册失败', 'Failed to save')
-      this.removeTempImage(path)
-    }
   }
 
   // ===== 录音（阶段 2 实现） =====
