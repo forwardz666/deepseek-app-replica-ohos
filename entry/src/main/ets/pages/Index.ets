@@ -1,7 +1,7 @@
 import { webview } from '@kit.ArkWeb'
 import { common } from '@kit.AbilityKit'
-import { fileIo as fs } from '@kit.CoreFileKit'
-import { BusinessError } from '@kit.BasicServicesKit'
+import { fileIo as fs, picker } from '@kit.CoreFileKit'
+import { BusinessError, deviceInfo } from '@kit.BasicServicesKit'
 import { DeepSeekBridge } from '../bridge/DeepSeekBridge'
 
 /**
@@ -263,6 +263,10 @@ struct Index {
         console.info('ArkWeb controller attached')
         this.diag = `${this.diag} | attached`.substring(0, 240)
       })
+      .onShowFileSelector((event: OnShowFileSelectorEvent): boolean => {
+        this.onWebFileSelector(event)
+        return true
+      })
       .onPageBegin((event: OnPageBeginEvent) => {
         const u: string = event.url
         this.diag3 = `begin ${u.length > 60 ? u.substring(0, 60) : u}`
@@ -310,6 +314,124 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+  }
+
+  /**
+   * Web 侧 input[type=file] 触发的选择器：手机/平板上图片类一步直达系统相册
+   * （PhotoViewPicker 图库网格），2in1 与非图片类走系统文件选择器。
+   * 选中后复制到沙箱临时文件再 handleFileList 回传（ArkWeb 无法直接读媒体 uri），
+   * Web 层按 File 对象继续原有上传流程，无需改动。
+   */
+  private onWebFileSelector(event: OnShowFileSelectorEvent): void {
+    const selector: FileSelectorParam = event.fileSelector
+    const accept: Array<string> = selector.getAcceptType()
+    let isImage = false
+    for (let i = 0; i < accept.length; i++) {
+      if (accept[i].startsWith('image/')) {
+        isImage = true
+        break
+      }
+    }
+    const device = deviceInfo.deviceType
+    if (isImage && !selector.isCapture() && device !== '2in1') {
+      this.pickFromGallery(event)
+      return
+    }
+    this.pickWithDocumentPicker(event)
+  }
+
+  private pickFromGallery(event: OnShowFileSelectorEvent): void {
+    const photoPicker = new picker.PhotoViewPicker()
+    const options: picker.PhotoSelectOptions = {
+      MIMEType: picker.PhotoViewMIMETypes.IMAGE_TYPE,
+      maxSelectNumber: 9
+    }
+    photoPicker.select(options).then((result: picker.PhotoSelectResult) => {
+      const uris: Array<string> = result.photoUris
+      if (!uris || uris.length === 0) {
+        event.result.handleFileList([])
+        return
+      }
+      const ctx = getContext(this) as common.UIAbilityContext
+      const dir = `${ctx.cacheDir}/picked`
+      try {
+        if (!fs.accessSync(dir).valueOf()) {
+          fs.mkdirSync(dir, true)
+        }
+      } catch (err) {
+        // mkdir 失败时单个 copy 也会失败并跳过
+      }
+      const files: string[] = []
+      const stamp = Date.now()
+      for (let i = 0; i < uris.length; i++) {
+        try {
+          const src = fs.openSync(uris[i], fs.OpenMode.READ_ONLY)
+          const tmp = `${dir}/pick_${stamp}_${i}`
+          fs.copyFileSync(src.fd, tmp)
+          fs.closeSync(src.fd)
+          const ext = this.sniffImageExt(tmp)
+          const dst = `${tmp}.${ext}`
+          try {
+            fs.renameSync(tmp, dst)
+          } catch (err) {
+            // 改名失败则保留无扩展名临时名
+          }
+          files.push(`file://${dst}`)
+        } catch (err) {
+          // 单张失败不影响其余选中项
+        }
+      }
+      event.result.handleFileList(files)
+    }).catch((err: BusinessError) => {
+      console.error(`gallery pick failed: ${JSON.stringify(err)}`)
+      event.result.handleFileList([])
+    })
+  }
+
+  /** 读头部魔数推断扩展名（相册 uri 不携带文件名信息）。 */
+  private sniffImageExt(path: string): string {
+    try {
+      const file = fs.openSync(path, fs.OpenMode.READ_ONLY)
+      const buf = new ArrayBuffer(12)
+      fs.readSync(file.fd, buf, { offset: 0, length: 12 })
+      fs.closeSync(file.fd)
+      const b = new Uint8Array(buf)
+      if (b[0] === 0xFF && b[1] === 0xD8) {
+        return 'jpg'
+      }
+      if (b[0] === 0x89 && b[1] === 0x50) {
+        return 'png'
+      }
+      if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) {
+        return 'gif'
+      }
+      if (b[0] === 0x42 && b[1] === 0x4D) {
+        return 'bmp'
+      }
+      if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46) {
+        return 'webp'
+      }
+      if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) {
+        return 'heic'
+      }
+      return 'jpg'
+    } catch (err) {
+      return 'jpg'
+    }
+  }
+
+  /** 2in1 与非图片类：系统文件选择器（保持 PC 现状）。 */
+  private pickWithDocumentPicker(event: OnShowFileSelectorEvent): void {
+    const docPicker = new picker.DocumentViewPicker()
+    const options: picker.DocumentSelectOptions = {
+      maxSelectNumber: 9
+    }
+    docPicker.select(options).then((uris: Array<string>) => {
+      event.result.handleFileList(uris)
+    }).catch((err: BusinessError) => {
+      console.error(`document pick failed: ${JSON.stringify(err)}`)
+      event.result.handleFileList([])
+    })
   }
 
   private notFound(): WebResourceResponse {

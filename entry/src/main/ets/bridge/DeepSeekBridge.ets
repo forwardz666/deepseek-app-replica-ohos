@@ -3,7 +3,10 @@ import { webview } from '@kit.ArkWeb'
 import { abilityAccessCtrl, common } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { util } from '@kit.ArkTS'
-import { fileIo as fs } from '@kit.CoreFileKit'
+import { fileIo as fs, fileUri } from '@kit.CoreFileKit'
+import { photoAccessHelper } from '@kit.MediaLibraryKit'
+import { promptAction } from '@kit.ArkUI'
+import { i18n } from '@kit.LocalizationKit'
 
 /**
  * DeepSeekAndroid 桥：对齐 Web 层 src/app/android.ts 的 AndroidBridge 契约。
@@ -275,19 +278,38 @@ export class DeepSeekBridge {
     return this.closeExport()
   }
 
-  // ===== 图片保存（写入公共 Download/DeepSeek Replica/Images/，与导出同模式） =====
+  // ===== 图片保存（写入沙箱临时文件，finish 后经系统弹窗存入系统相册） =====
 
   private imageFd: number = -1
   private imagePath: string | null = null
-  private static readonly IMAGE_SUBDIR: string = 'DeepSeek Replica/Images'
+  private imageTitle: string | null = null
+  private static readonly IMAGE_SAVES_DIR: string = 'saves'
 
-  /** 图片保存目录未就绪（未授权）时申请权限，为下次保存做准备 */
-  private requestDownloadPermission(): void {
-    abilityAccessCtrl.createAtManager()
-      .requestPermissionsFromUser(this.context, ['ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY'])
-      .catch((err: BusinessError) => {
-        console.error(`download permission request failed: ${JSON.stringify(err)}`)
-      })
+  private extForMime(type: string): string {
+    if (type === 'image/png') {
+      return 'png'
+    }
+    if (type === 'image/webp') {
+      return 'webp'
+    }
+    if (type === 'image/gif') {
+      return 'gif'
+    }
+    if (type === 'image/jpeg' || type === 'image/jpg') {
+      return 'jpg'
+    }
+    return ''
+  }
+
+  /** 跟随系统语言的轻提示（Web 层 i18n 不可达 native，按系统语言二选一） */
+  private toast(msgZh: string, msgEn: string): void {
+    let zh = true
+    try {
+      zh = i18n.System.getSystemLanguage().startsWith('zh')
+    } catch (err) {
+      // 默认中文
+    }
+    promptAction.showToast({ message: zh ? msgZh : msgEn, duration: 2000 })
   }
 
   beginImageSave(name: string, mime: string): boolean {
@@ -312,24 +334,31 @@ export class DeepSeekBridge {
         return false
       }
     }
+    const ext = this.extForMime(type)
+    if (ext === '') {
+      return false
+    }
+    // 相册资产 title 必须带扩展名；文件名缺省时按 mime 补全
+    const dot = fileName.lastIndexOf('.')
+    const hasExt = dot > 0 && ['png', 'webp', 'gif', 'jpg', 'jpeg']
+      .includes(fileName.substring(dot + 1).toLowerCase())
+    if (!hasExt) {
+      fileName = `${fileName}.${ext}`
+    }
     const sanitized = this.sanitizeExportName(fileName)
     if (sanitized === null) {
       return false
     }
-    const dir = this.pickDownloadDir()
-    if (dir === null) {
-      this.requestDownloadPermission()
-      return false
-    }
     try {
-      const target = `${dir}/${DeepSeekBridge.IMAGE_SUBDIR}`
-      if (!fs.accessSync(target).valueOf()) {
-        fs.mkdirSync(target, true)
+      const dir = `${this.context.cacheDir}/${DeepSeekBridge.IMAGE_SAVES_DIR}`
+      if (!fs.accessSync(dir).valueOf()) {
+        fs.mkdirSync(dir, true)
       }
-      const file = fs.openSync(`${target}/${sanitized}`,
+      const file = fs.openSync(`${dir}/${sanitized}`,
         fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC)
       this.imageFd = file.fd
-      this.imagePath = `${target}/${sanitized}`
+      this.imagePath = `${dir}/${sanitized}`
+      this.imageTitle = sanitized
       return true
     } catch (err) {
       console.error(`beginImageSave failed: ${JSON.stringify(err)}`)
@@ -355,8 +384,10 @@ export class DeepSeekBridge {
   finishImageSave(keep: boolean): boolean {
     const fd = this.imageFd
     const path = this.imagePath
+    const title = this.imageTitle
     this.imageFd = -1
     this.imagePath = null
+    this.imageTitle = null
     if (fd < 0) {
       return false
     }
@@ -366,15 +397,58 @@ export class DeepSeekBridge {
       console.error(`closeImageSave failed: ${JSON.stringify(err)}`)
       return false
     }
-    if (!keep && path !== null) {
-      try {
-        fs.unlinkSync(path)
-      } catch (err) {
-        console.error(`unlinkImageSave failed: ${JSON.stringify(err)}`)
-      }
+    if (!keep || path === null || title === null) {
+      this.removeTempImage(path)
       return false
     }
+    // 文件已完整落盘：弹系统相册保存对话框（异步），结果经 toast 反馈
+    this.saveToGallery(title, path)
     return true
+  }
+
+  private removeTempImage(path: string | null): void {
+    if (path === null) {
+      return
+    }
+    try {
+      fs.unlinkSync(path)
+    } catch (err) {
+      // 清理失败不影响主流程
+    }
+  }
+
+  /**
+   * showAssetsCreationDialog：系统提供的媒体资产保存确认对话框，三方应用免权限。
+   * 传入沙箱临时文件的 file:// uri，用户确认后图片进入系统相册（图库可见）；
+   * 取消/失败均清理临时文件。
+   */
+  private saveToGallery(title: string, path: string): void {
+    try {
+      const helper = photoAccessHelper.getPhotoAccessHelper(this.context)
+      const dot = title.lastIndexOf('.')
+      const config: photoAccessHelper.PhotoCreationConfig = {
+        title: title,
+        fileNameExtension: dot >= 0 ? title.substring(dot + 1) : 'jpg',
+        photoType: photoAccessHelper.PhotoType.IMAGE
+      }
+      const srcUri = fileUri.getUriFromPath(path)
+      helper.showAssetsCreationDialog([srcUri], [config]).then((uris: Array<string>) => {
+        if (uris.length > 0) {
+          this.toast('已保存到系统相册', 'Saved to gallery')
+        } else {
+          this.toast('已取消保存', 'Save cancelled')
+        }
+        this.removeTempImage(path)
+      }).catch((err: BusinessError) => {
+        console.error(`saveToGallery failed: ${JSON.stringify(err)}`)
+        this.toast('保存到相册失败', 'Failed to save')
+        this.removeTempImage(path)
+      })
+    } catch (err) {
+      console.error(`saveToGallery setup failed: ${JSON.stringify(err)}`)
+      this.toast('保存到相册失败', 'Failed to save')
+      this.removeTempImage(path)
+    }
   }
 
   // ===== 录音（阶段 2 实现） =====
