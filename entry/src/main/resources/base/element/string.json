@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "app_name", "value": "DeepSeek Replica" },
+    {
+      "name": "download_permission_reason",
+      "value": "用于将导出的历史对话保存到下载文件夹中的「DeepSeek Replica」目录"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "modelVersion": "6.0.0",
+  "name": "dsreplica-harmonyos",
+  "version": "1.0.0",
+  "description": "DeepSeek App Replica HarmonyOS shell (GPL-3.0)",
+  "main": "",
+  "author": "",
+  "license": "GPL-3.0-or-later",
+  "dependencies": {}
+}

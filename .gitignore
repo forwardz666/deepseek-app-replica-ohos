@@ -1,0 +1,10 @@
+# Build outputs
+out/
+entry/build/
+
+# Dependency & tool caches
+oh_modules/
+.hvigor/
+
+# IDE
+.idea/

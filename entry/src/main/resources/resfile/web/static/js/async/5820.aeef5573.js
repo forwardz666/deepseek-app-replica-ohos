@@ -1,0 +1,1 @@
+"use strict";(Array.isArray(globalThis.webpackChunkdeepseek_app_replica)?globalThis.webpackChunkdeepseek_app_replica:globalThis.webpackChunkdeepseek_app_replica=[]).push([[5820],{5820(e,a,p){p.d(a,{createArchitectureServices:()=>r.S});var r=p(3738);p(976)}}]);
