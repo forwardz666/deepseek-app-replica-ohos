@@ -1,5 +1,9 @@
 {
   "color": [
-    { "name": "start_window_background", "value": "#FFFFFF" }
+    { "name": "start_window_background", "value": "#FFFFFF" },
+    { "name": "panel_background", "value": "#FFFFFF" },
+    { "name": "panel_text_primary", "value": "#1A1A1A" },
+    { "name": "panel_text_secondary", "value": "#8A8A8A" },
+    { "name": "panel_mask", "value": "#66000000" }
   ]
 }

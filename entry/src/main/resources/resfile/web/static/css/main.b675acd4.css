@@ -6719,6 +6719,18 @@ a.row-b6d01b:active,
   flex-shrink: 0;
 }
 
+/* 标题占满剩余宽度，右侧一组「搜索 + 收起」紧贴右边缘 */
+.top-e11617 > .appName-b9b41b {
+  flex: 1 1 auto;
+}
+
+.topActions-d9d070 {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
 .appName-b9b41b {
   min-width: 0;
   padding-left: 4px;
@@ -6859,6 +6871,23 @@ a.row-b6d01b:active,
   &:focus-visible {
     box-shadow: inset 0 0 0 2px var(--dsw-alias-button-primary-fill);
   }
+}
+
+.settingsIcon-eb8100 {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--dsw-alias-bg-skeleton);
+  color: var(--dsw-alias-label-tertiary);
+  line-height: 0;
+}
+
+.settingsIcon-eb8100 > svg {
+  width: 18px;
+  height: 18px;
 }
 
 .settingsLabel-cc99d0 {
@@ -7024,19 +7053,20 @@ a.row-b6d01b:active,
     }
   }
 
+  .settingsLabel-cc99d0 {
+    flex: 1;
+    margin-left: 10px;
+    line-height: 22.4px;
+  }
+
   .settingsIcon-eb8100 {
     width: 44.8px;
     height: 44.8px;
-    border-radius: 50%;
-    background: var(--dsw-alias-bg-skeleton);
-    color: #a2a5a8;
-    overflow: hidden;
   }
 
-  .settingsLabel-cc99d0 {
-    flex: 1;
-    margin-left: 1.7778px;
-    line-height: 22.4px;
+  .settingsIcon-eb8100 > svg {
+    width: 20px;
+    height: 20px;
   }
 
   .settings-eb3417 > svg {
@@ -7353,8 +7383,10 @@ a.row-b6d01b:active,
     line-height: 22.4px;
   }
 
+  /* 按压态跟随主题：浅色是浅蓝，深色是深蓝底 + 亮蓝字。
+     写死浅色 rgb 会让深色模式出现白底白字（且刺眼）。 */
   &:active {
-    background: rgb(227 233 246);
+    background: var(--dsw-alias-button-ghost-active-fill);
   }
 
   &.tapHighlight-c99666 {
@@ -7366,13 +7398,13 @@ a.row-b6d01b:active,
   0%,
   30% {
     color: var(--dsw-alias-brand-text);
-    background-color: rgb(237 241 254);
+    background-color: var(--dsw-alias-button-ghost-active-fill);
   }
 
   30.1%,
   100% {
-    color: rgb(60 104 248);
-    background-color: rgb(227 233 246);
+    color: var(--dsw-alias-brand-text);
+    background-color: var(--dsw-alias-button-ghost-active-hover);
   }
 }
 

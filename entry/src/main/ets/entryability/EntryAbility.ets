@@ -1,4 +1,4 @@
-import { AbilityConstant, UIAbility, Want, abilityAccessCtrl, Permissions } from '@kit.AbilityKit'
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want, abilityAccessCtrl, Permissions } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { window } from '@kit.ArkUI'
 import display from '@ohos.display'
@@ -22,6 +22,14 @@ export default class EntryAbility extends UIAbility {
     try {
       const mainWin = windowStage.getMainWindowSync()
       mainWin.setWindowLayoutFullScreen(true)
+      // 窗口自身底色跟随深浅色，且与 Web 深色主题背景（rgb(21,21,23)）一致：
+      // 启动图消失到 Web 首帧绘制之间的间隙若沿用系统默认白底，深色下会闪白。
+      const dark = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+      try {
+        mainWin.setWindowBackgroundColor(dark ? '#151517' : '#FFFFFF')
+      } catch (err) {
+        hilog.error(0x0000, TAG, `setWindowBackgroundColor failed: ${JSON.stringify(err)}`)
+      }
 
       const systemArea = mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM)
       const navArea = mainWin.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR)

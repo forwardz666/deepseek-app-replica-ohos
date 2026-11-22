@@ -80,6 +80,7 @@ const MQ_FIX_SCRIPT: string = `(function () {
 
 // 对齐 Web 层 AndroidBridge 的全部桥方法（不含已废弃的 update 三个）
 const BRIDGE_METHODS: string[] = [
+  'appVersion',
   'statusInset', 'buttonNavigationInset', 'systemFontScale',
   'openAppPermissions', 'getMusicVolume', 'openSourcePage',
   'readApiKey', 'writeApiKey', 'readChatConfig', 'writeChatConfig',
@@ -91,6 +92,9 @@ const BRIDGE_METHODS: string[] = [
   'requestHistoryExport', 'writeHistoryExport', 'finishHistoryExport',
   'beginImageSave', 'writeImageSave', 'finishImageSave',
   'requestRecording', 'finishRecording', 'recordingLevel',
+  'recordingSize', 'readRecordingChunk',
+  'localTtsSpeak', 'localTtsStop', 'localAsrAvailable',
+  'localAsrStart', 'localAsrStop', 'localAsrCancel',
   'setSelectionExclusion'
 ]
 
@@ -148,7 +152,21 @@ struct Index {
   @State diag2: string = ''
   @State diag3: string = ''
   @State diagErr: boolean = false
-  @State webSrc: string = 'about:blank'
+  /**
+   * 空串表示「还没确定要加载的页面」——此时不创建 Web 组件。
+   * 之前初始值是 'about:blank'，Web 会先绘制一张白页再被替换，
+   * 深色模式下这就是启动图（黑）结束后那一下白闪的来源。
+   */
+  @State webSrc: string = ''
+  /**
+   * Web 内容首帧绘制完成前保持透明：ArkWeb 的合成层在拿到第一帧之前会
+   * 先呈现一块默认白底，这层白就是深色模式下启动图之后的残影。
+   * 透明期间露出的是父容器的主题色（深色 #151517），因此全程无缝。
+   */
+  @State webPainted: boolean = false
+  /** 相册保存授权面板：非空表示正在等待用户点安全控件 */
+  @State gallerySavePath: string = ''
+  @State gallerySaveTitle: string = ''
   controller: webview.WebviewController = new webview.WebviewController()
   private bridge: DeepSeekBridge =
     new DeepSeekBridge(this.controller, getContext(this) as common.UIAbilityContext)
@@ -161,6 +179,16 @@ struct Index {
       this.bridge.attachUIContext(this.getUIContext())
     } catch (err) {
       console.warn(`attachUIContext failed: ${JSON.stringify(err)}`)
+    }
+    // 图片保存需要用户点安全控件授权，桥接层通过这个回调把请求转给本页面
+    try {
+      this.bridge.attachGallerySaveUi((title: string, path: string): boolean => {
+        this.gallerySaveTitle = title
+        this.gallerySavePath = path
+        return true
+      })
+    } catch (err) {
+      console.warn(`attachGallerySaveUi failed: ${JSON.stringify(err)}`)
     }
     // v9：改用 resfile 方案（官方 electron.hap 验证可行）：dist 放
     // resources/resfile/web/，安装时解包为真实文件，运行时直接 file:// 加载，
@@ -187,6 +215,15 @@ struct Index {
       this.diag = `${this.diag} | src set`
     } else {
       this.diagErr = true
+    }
+  }
+
+  aboutToDisappear(): void {
+    // 语音引擎（本地 TTS / 离线识别）是重资源，页面销毁时必须释放
+    try {
+      this.bridge.releaseSpeech()
+    } catch (err) {
+      console.warn(`releaseSpeech failed: ${JSON.stringify(err)}`)
     }
   }
 
@@ -223,8 +260,11 @@ struct Index {
   }
 
   build() {
-    Column() {
-      Web({ src: this.webSrc, controller: this.controller })
+    Stack() {
+      Column() {
+        // 只在确定 URL 后才创建 Web：避免 about:blank 先画一帧白底
+        if (this.webSrc !== '') {
+        Web({ src: this.webSrc, controller: this.controller })
       .javaScriptProxy({
         object: this.bridge,
         name: 'DeepSeekAndroid',
@@ -294,11 +334,17 @@ struct Index {
       .onPageEnd((_event: OnPageEndEvent) => {
         this.diag3 = 'page loaded'
         console.info('page end')
+        // 兜底：个别情况下首帧回调不触发，页面加载完也要显示
+        this.webPainted = true
         this.probe('t0')
         setTimeout(() => {
           this.probe('t2')
         }, 2000)
       })
+      .onFirstContentfulPaint((_event: OnFirstContentfulPaintEvent) => {
+        this.webPainted = true
+      })
+      .opacity(this.webPainted ? 1 : 0)
       .onHttpErrorReceive((event: OnHttpErrorReceiveEvent) => {
         const u: string = event.request.getRequestUrl()
         const code: number = event.response.getResponseCode()
@@ -328,11 +374,90 @@ struct Index {
         console.error(`resource error: ${u} ${e}`)
       })
       .darkMode(WebDarkMode.Auto)
+      // 与启动窗口背景同色：Web 首帧尚未绘制时不会露出系统默认白底，
+      // 深色模式下从黑底启动图过渡到页面是无缝的
+      .backgroundColor($r('app.color.start_window_background'))
       .width('100%')
       .layoutWeight(1)
+        }
+      }
+      .width('100%')
+      .height('100%')
+      // 相册保存授权面板：系统只认可安全控件 SaveButton 的临时授权，
+      // 因此用户点「保存到相册」时先浮出这一层，让用户亲手点一下安全控件。
+      if (this.gallerySavePath !== '') {
+        this.gallerySavePanel()
+      }
     }
     .width('100%')
     .height('100%')
+    .backgroundColor($r('app.color.start_window_background'))
+  }
+
+  /**
+   * 相册保存授权面板。
+   *
+   * 为什么必须有这层 UI：三方应用写相册需要 WRITE_IMAGEVIDEO（系统级权限，拿不到），
+   * 唯一合法路径是用户点击 SaveButton 安全控件时系统下发的一次性临时授权。
+   * 授权只在该次点击的调用栈内有效，所以这里一拿到 SUCCESS 就立刻交给桥接层写文件。
+   */
+  @Builder
+  gallerySavePanel() {
+    Column() {
+      Column() {
+        Text(this.gallerySaveTitle)
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('app.color.panel_text_primary'))
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ bottom: 8 })
+        Text('点击下方按钮授权保存到系统相册')
+          .fontSize(13)
+          .fontColor($r('app.color.panel_text_secondary'))
+          .margin({ bottom: 20 })
+        SaveButton({ icon: SaveIconStyle.FULL_FILLED, text: SaveDescription.SAVE_IMAGE })
+          .onClick((_event: ClickEvent, result: SaveButtonOnClickResult) => {
+            this.closeGallerySavePanel(result === SaveButtonOnClickResult.SUCCESS)
+          })
+          .width('100%')
+          .height(40)
+        Button('取消')
+          .backgroundColor(Color.Transparent)
+          .fontColor($r('app.color.panel_text_secondary'))
+          .fontSize(15)
+          .width('100%')
+          .height(40)
+          .margin({ top: 4 })
+          .onClick(() => {
+            this.closeGallerySavePanel(false)
+          })
+      }
+      .width('82%')
+      .constraintSize({ maxWidth: 360 })
+      .padding(24)
+      .borderRadius(20)
+      .backgroundColor($r('app.color.panel_background'))
+    }
+    .width('100%')
+    .height('100%')
+    .justifyContent(FlexAlign.Center)
+    .backgroundColor($r('app.color.panel_mask'))
+    // 刻意不给遮罩加 onClick：ArkUI 的点击会向上冒泡，加了之后用户点安全控件
+    // 会先被遮罩的「取消」截走，临时授权拿不到就永远存不进相册。
+    // 关闭面板只走下方「取消」按钮。
+  }
+
+  /** 关闭授权面板并把结果交给桥接层（true = 已获得临时授权）。 */
+  private closeGallerySavePanel(authorized: boolean): void {
+    const path = this.gallerySavePath
+    const title = this.gallerySaveTitle
+    if (path === '') {
+      return
+    }
+    this.gallerySavePath = ''
+    this.gallerySaveTitle = ''
+    this.bridge.commitGallerySave(title, path, authorized)
   }
 
   /**

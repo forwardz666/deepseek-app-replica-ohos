@@ -13,6 +13,11 @@
         "name": "ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
         "reason": "$string:download_permission_reason",
         "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
+      },
+      {
+        "name": "ohos.permission.MICROPHONE",
+        "reason": "$string:mic_permission_reason",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
       }
     ],
     "abilities": [
@@ -22,7 +27,7 @@
         "description": "DeepSeek App Replica web host",
         "icon": "$media:icon",
         "label": "$string:app_name",
-        "startWindowIcon": "$media:icon",
+        "startWindowIcon": "$media:start_icon",
         "startWindowBackground": "$color:start_window_background",
         "orientation": "unspecified",
         "supportWindowMode": ["fullscreen", "split", "floating"],

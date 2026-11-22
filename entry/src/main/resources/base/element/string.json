@@ -4,6 +4,10 @@
     {
       "name": "download_permission_reason",
       "value": "用于将导出的历史对话保存到下载文件夹中的「DeepSeek Replica」目录"
+    },
+    {
+      "name": "mic_permission_reason",
+      "value": "用于录制语音并转写为文字"
     }
   ]
 }
