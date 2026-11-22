@@ -76,7 +76,7 @@ DeepSeek App Replica 的 HarmonyOS（OpenHarmony）适配版 —— 尽可能复
 
 - **ArkUI 原生层**：基于 ArkTS 与 OpenHarmony SDK 26。`entry/src/main/ets/` 由主页面（`Index.ets`，承载 ArkWeb WebView）、JS 桥（`DeepSeekBridge.ets`）与服务层（`services/`）组成。封装系统能力：API Key 与配置的本地存储、历史对话导出（Base64 分块传输写入公共下载目录）、图片保存（三级通道写入系统相册）、麦克风录音、系统本地 TTS 与端侧语音识别、外链打开、权限申请等。
 - **Web 交互层**：与上游 Android 版同源的 React 18 + TypeScript 构建产物（`entry/src/main/resources/resfile/web/`），包含 KaTeX、Mermaid 与 Prism.js 排版渲染，直接由 ArkWeb 从本地加载，无需网络。
-- **通信协议**：Web 层通过 `window.DeepSeekAndroid` 桥对象调用原生方法，原生通过 `CustomEvent` 向 Web 层派发异步事件（导出进度、朗读状态、识别结果等）。系统语音能力在 OpenHarmony SDK 中没有 `@kit.CoreSpeechKit` 声明，原生层按其运行时模块名（`@hms.ai.textToSpeech` / `@hms.ai.speechRecognizer`）通过 `requireNapi` 直接加载。
+- **通信协议**：Web 层通过 `window.DeepSeekAndroid` 桥对象调用原生方法，原生通过 `CustomEvent` 向 Web 层派发异步事件（导出进度、朗读状态、识别结果等）。系统语音能力在 OpenHarmony SDK 中没有 `@kit.CoreSpeechKit` 声明，原生层按其运行时模块名（`@hms.ai.textToSpeech` / `@hms.ai.speechRecognizer`）通过 `requireNapi` 直接加载；接入方式参考了 [Deepseek GO（HarmonyOS）](https://github.com/APXS114514/DeepSeekGo-Harmony)。
 
 ## 源码构建
 
@@ -142,5 +142,7 @@ hvigorw assembleHap --mode module -p product=default --no-daemon
 本项目采用 [GPL-3.0 许可证](LICENSE)。
 
 本项目的 Web 交互层与整体设计源自 **[DeepSeek App Replica（Android）](https://github.com/LiJiaHua1024/deepseek-app-replica)**，感谢原作者 **LiJiaHua1024** 的高质量开源工作 —— 本仓库的鸿蒙适配正是建立在这一基础之上；部分基础代码源自 DeepSeek 官方开源的 [chat-demo](https://github.com/deepseek-ai/chat-demo)（MIT 许可证），依其条款保留原作者版权声明。
+
+系统语音能力（本地 TTS 与端侧语音识别）的接入参考了 **[Deepseek GO（HarmonyOS）](https://github.com/APXS114514/DeepSeekGo-Harmony)**（MIT 许可证，作者 **APXS114514**）。本仓库在 Core Speech Kit 的引擎创建形态、朗读的 `playType` 播放模式、端侧识别由引擎直接采集麦克风而非写入音频文件等关键细节上，均得益于该项目的实现。如果只想找一个专注鸿蒙原生的 DeepSeek 客户端，推荐直接使用它。
 
 对上述所有先行者与开源社区贡献者的成果表示敬意与感谢。
